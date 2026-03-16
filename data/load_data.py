@@ -1,17 +1,40 @@
 import json
 import os
+import random
 from typing import List, Dict, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from sklearn.model_selection import train_test_split
 
 
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
+
+
+def _normalize_image_size(image_size) -> Optional[Tuple[int, int]]:
+    if image_size is None:
+        return None
+
+    if isinstance(image_size, int):
+        return (image_size, image_size)
+
+    if len(image_size) != 2:
+        raise ValueError(f"image_size must be None, int, or (H, W). Got: {image_size}")
+
+    return (int(image_size[0]), int(image_size[1]))
+
+
+def _image_size_tag(image_size) -> str:
+    normalized_size = _normalize_image_size(image_size)
+    if normalized_size is None:
+        return "original"
+
+    return f"{normalized_size[0]}x{normalized_size[1]}"
 
 
 def _list_files(folder_path: str) -> List[str]:
@@ -47,6 +70,7 @@ def _validate_pairs(image_dir: str, mask_dir: str) -> List[str]:
 
 
 def _build_image_transform(image_size=None, mean=IMAGE_MEAN, std=IMAGE_STD):
+    image_size = _normalize_image_size(image_size)
     transform_steps = []
 
     if image_size is not None:
@@ -65,6 +89,7 @@ def _build_image_transform(image_size=None, mean=IMAGE_MEAN, std=IMAGE_STD):
 
 
 def _build_mask_transform(image_size=None):
+    image_size = _normalize_image_size(image_size)
     transform_steps = []
 
     if image_size is not None:
@@ -91,29 +116,100 @@ class PolypDataset(Dataset):
         image_size=None,
         mean=IMAGE_MEAN,
         std=IMAGE_STD,
+        augment: bool = False,
     ):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.file_names = file_names
+        self.augment = augment
+        self.image_size = _normalize_image_size(image_size)
+        self.mean = mean
+        self.std = std
         self.image_transform = _build_image_transform(
-            image_size=image_size, mean=mean, std=std
+            image_size=self.image_size, mean=mean, std=std
         )
-        self.mask_transform = _build_mask_transform(image_size=image_size)
+        self.mask_transform = _build_mask_transform(image_size=self.image_size)
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.10,
+            hue=0.03,
+        )
 
     def __len__(self):
         return len(self.file_names)
+
+    def _apply_train_augmentation(self, image: Image.Image, mask: Image.Image):
+        if random.random() < 0.5:
+            image = TF.hflip(image)
+            mask = TF.hflip(mask)
+
+        if random.random() < 0.2:
+            image = TF.vflip(image)
+            mask = TF.vflip(mask)
+
+        angle = random.uniform(-12.0, 12.0)
+        translate = (
+            int(image.width * random.uniform(-0.05, 0.05)),
+            int(image.height * random.uniform(-0.05, 0.05)),
+        )
+        scale = random.uniform(0.95, 1.05)
+        shear = [random.uniform(-5.0, 5.0), 0.0]
+
+        image = TF.affine(
+            image,
+            angle=angle,
+            translate=translate,
+            scale=scale,
+            shear=shear,
+            interpolation=InterpolationMode.BILINEAR,
+            fill=0,
+        )
+        mask = TF.affine(
+            mask,
+            angle=angle,
+            translate=translate,
+            scale=scale,
+            shear=shear,
+            interpolation=InterpolationMode.NEAREST,
+            fill=0,
+        )
+
+        if self.image_size is not None:
+            image = TF.resize(
+                image,
+                self.image_size,
+                interpolation=InterpolationMode.BILINEAR,
+            )
+            mask = TF.resize(
+                mask,
+                self.image_size,
+                interpolation=InterpolationMode.NEAREST,
+            )
+
+        image = self.color_jitter(image)
+        image = TF.to_tensor(image)
+        image = TF.normalize(image, mean=self.mean, std=self.std)
+
+        mask = TF.to_tensor(mask)
+        mask = (mask > 0.5).float()
+        return image, mask
 
     def __getitem__(self, index: int):
         file_name = self.file_names[index]
         image_path = os.path.join(self.image_dir, file_name)
         mask_path = os.path.join(self.mask_dir, file_name)
 
-        with Image.open(image_path) as image:
-            image = self.image_transform(image.convert("RGB"))
+        with Image.open(image_path) as image, Image.open(mask_path) as mask:
+            image = image.convert("RGB")
+            mask = mask.convert("L")
 
-        with Image.open(mask_path) as mask:
-            mask = self.mask_transform(mask.convert("L"))
-            mask = (mask > 0.5).float()
+            if self.augment:
+                image, mask = self._apply_train_augmentation(image, mask)
+            else:
+                image = self.image_transform(image)
+                mask = self.mask_transform(mask)
+                mask = (mask > 0.5).float()
 
         return {
             "image": image,
@@ -247,6 +343,7 @@ def build_dataloaders(
     mean=IMAGE_MEAN,
     std=IMAGE_STD,
     descending: bool = True,
+    train_augmentation: bool = False,
 ):
     """
     Trả về:
@@ -276,7 +373,11 @@ def build_dataloaders(
     )
 
     # 2) Chia phần inner_train thành các task theo mask size
-    ratio_cache_path = os.path.join(file_path, "mask_ratio_cache.json")
+    image_size = _normalize_image_size(image_size)
+    ratio_cache_path = os.path.join(
+        file_path,
+        f"mask_ratio_cache_{_image_size_tag(image_size)}.json",
+    )
     task_infos = split_file_names_by_mask_size(
         image_dir=train_image_dir,
         mask_dir=train_mask_dir,
@@ -299,6 +400,7 @@ def build_dataloaders(
             image_size=image_size,
             mean=mean,
             std=std,
+            augment=train_augmentation,
         )
         train_task_datasets.append(task_dataset)
 
@@ -319,6 +421,7 @@ def build_dataloaders(
         image_size=image_size,
         mean=mean,
         std=std,
+        augment=train_augmentation,
     )
     train_loader_full = _build_loader(
         dataset=train_dataset_full,
@@ -367,6 +470,8 @@ def build_dataloaders(
         "num_inner_train_samples": len(inner_train_names),
         "num_val_samples": len(val_names),
         "num_test_samples": len(test_file_names),
+        "image_size": list(image_size) if image_size is not None else None,
+        "train_augmentation": train_augmentation,
         "task_infos": task_infos,
     }
 
