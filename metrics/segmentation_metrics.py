@@ -12,16 +12,11 @@ def compute_segmentation_metrics(
     threshold: float = 0.5,
     eps: float = 1e-7,
 ):
-    """
-    Tính metrics cho binary segmentation.
-    Trả về mean trên batch.
-    """
     probs = torch.sigmoid(logits)
     preds = (probs > threshold).float()
     targets = targets.float()
 
     dims = (1, 2, 3)
-
     tp = (preds * targets).sum(dim=dims)
     fp = (preds * (1.0 - targets)).sum(dim=dims)
     fn = ((1.0 - preds) * targets).sum(dim=dims)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from typing import Dict, Optional, Tuple
 
@@ -25,18 +27,12 @@ class AverageMeter:
 
 
 def _expand_memory_for_batch(
-    memory_state: Optional[torch.Tensor],
+    memory_state: Optional[Dict[str, torch.Tensor]],
     batch_size: int,
     device,
     dtype,
     model,
 ):
-    """
-    memory_state có thể là:
-    - None
-    - [memory_dim]
-    - [B, memory_dim]
-    """
     if memory_state is None:
         return model.init_memory(
             batch_size=batch_size,
@@ -47,20 +43,48 @@ def _expand_memory_for_batch(
             slow_scale=0.2,
         )
 
-    if memory_state.ndim == 1:
-        return memory_state.to(device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
+    expanded = {}
+    for stage, value in memory_state.items():
+        if value.ndim == 1:
+            expanded[stage] = value.to(device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
+        elif value.ndim == 2 and value.size(0) == batch_size:
+            expanded[stage] = value.to(device=device, dtype=dtype)
+        elif value.ndim == 2:
+            expanded[stage] = value.mean(dim=0).to(device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
+        else:
+            raise ValueError(f"Unsupported memory shape for {stage}: {value.shape}")
+    return expanded
 
-    if memory_state.ndim == 2:
-        if memory_state.size(0) == batch_size:
-            return memory_state.to(device=device, dtype=dtype)
 
-        summary = memory_state.mean(dim=0)
-        return summary.to(device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
-
-    raise ValueError(f"Unsupported memory_state shape: {memory_state.shape}")
+def _memory_reg(memory_before: Dict[str, torch.Tensor], memory_after: Dict[str, torch.Tensor]) -> torch.Tensor:
+    reg = 0.0
+    for stage in memory_before.keys():
+        reg = reg + (memory_after[stage] - memory_before[stage]).pow(2).mean()
+    return reg / max(len(memory_before), 1)
 
 
-def train_one_task_nested(
+def _memory_delta(memory_before: Dict[str, torch.Tensor], memory_after: Dict[str, torch.Tensor]) -> float:
+    delta = 0.0
+    for stage in memory_before.keys():
+        delta += (memory_after[stage] - memory_before[stage]).abs().mean().detach().item()
+    return delta / max(len(memory_before), 1)
+
+
+def _memory_norm(memory: Dict[str, torch.Tensor]) -> float:
+    value = 0.0
+    for stage in memory.keys():
+        value += memory[stage].abs().mean().detach().item()
+    return value / max(len(memory), 1)
+
+
+def _stack_memory_summaries(memory_summaries):
+    result = {}
+    for stage in memory_summaries[0].keys():
+        result[stage] = torch.stack([m[stage] for m in memory_summaries], dim=0).mean(dim=0).detach()
+    return result
+
+
+def train_one_task_nbm(
     model,
     loader,
     optimizer,
@@ -77,15 +101,8 @@ def train_one_task_nested(
     improve_margin: float = 0.005,
     before_weight: float = 0.3,
     print_freq: int = 20,
-    initial_memory: Optional[torch.Tensor] = None,
-) -> Tuple[Dict[str, float], torch.Tensor]:
-    """
-    Train 1 epoch trên 1 task cho nested-lite dual-memory.
-
-    Output:
-        metrics
-        memory_summary: [memory_dim]
-    """
+    initial_memory: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
     model.train()
 
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
@@ -98,17 +115,15 @@ def train_one_task_nested(
     mem_reg_meter = AverageMeter()
     mem_delta_meter = AverageMeter()
     mem_norm_meter = AverageMeter()
-
     dice_before_meter = AverageMeter()
     dice_after_meter = AverageMeter()
     dice_gain_meter = AverageMeter()
     iou_after_meter = AverageMeter()
     precision_after_meter = AverageMeter()
     recall_after_meter = AverageMeter()
-
     batch_time_meter = AverageMeter()
-    start_time = time.time()
 
+    start_time = time.time()
     memory = None
     memory_summaries = []
 
@@ -118,49 +133,26 @@ def train_one_task_nested(
         batch_size = images.size(0)
 
         if memory is None:
-            memory = _expand_memory_for_batch(
-                memory_state=initial_memory,
-                batch_size=batch_size,
-                device=device,
-                dtype=images.dtype,
-                model=model,
-            )
-        elif memory.size(0) != batch_size:
-            memory = _expand_memory_for_batch(
-                memory_state=memory,
-                batch_size=batch_size,
-                device=device,
-                dtype=images.dtype,
-                model=model,
-            )
+            memory = _expand_memory_for_batch(initial_memory, batch_size, device, images.dtype, model)
+        elif next(iter(memory.values())).size(0) != batch_size:
+            memory = _expand_memory_for_batch(memory, batch_size, device, images.dtype, model)
 
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device_type, enabled=amp_enabled):
             outputs_before = model(images, memory)
-            logits_before = outputs_before["logits"]
-            feat = outputs_before["feat"]
+            seg_loss_before, seg_before_dict = criterion(outputs_before, masks, return_components=True)
 
-            seg_loss_before, seg_before_dict = criterion(
-                logits_before, masks, return_components=True
-            )
-
-            loss_scalar = seg_loss_before.detach().view(1, 1).repeat(batch_size, 1)
             proposed_memory = model.compute_updated_memory(
-                feat=feat.detach(),
-                memory=memory.detach(),
-                loss_scalar=loss_scalar,
+                memory_features={k: v.detach() for k, v in outputs_before["memory_features"].items()},
+                memory={k: v.detach() for k, v in memory.items()},
+                update_signals={k: v.detach() for k, v in outputs_before["update_signals"].items()},
             )
 
             outputs_after = model(images, proposed_memory)
-            logits_after = outputs_after["logits"]
+            seg_loss_after, seg_after_dict = criterion(outputs_after, masks, return_components=True)
 
-            seg_loss_after, seg_after_dict = criterion(
-                logits_after, masks, return_components=True
-            )
-
-            memory_diff = proposed_memory - memory
-            memory_reg = (memory_diff ** 2).mean()
+            memory_reg = _memory_reg(memory, proposed_memory)
             improve_loss = torch.relu(seg_loss_after - seg_loss_before + improve_margin)
 
             total_loss = (
@@ -172,46 +164,36 @@ def train_one_task_nested(
 
         if scaler is not None and amp_enabled:
             scaler.scale(total_loss).backward()
-
             if grad_clip is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
             scaler.step(optimizer)
             scaler.update()
         else:
             total_loss.backward()
-
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
             optimizer.step()
 
         with torch.no_grad():
-            memory = proposed_memory.detach()
-            memory_summaries.append(memory.mean(dim=0).detach())
+            memory = {k: v.detach() for k, v in proposed_memory.items()}
+            memory_summaries.append(model.summarize_memory(memory))
 
-        metric_before = compute_segmentation_metrics(logits_before.detach(), masks)
-        metric_after = compute_segmentation_metrics(logits_after.detach(), masks)
-
-        mem_delta_value = memory_diff.abs().mean().detach().item()
-        mem_reg_value = memory_reg.detach().item()
-        mem_norm_value = proposed_memory.abs().mean().detach().item()
-        improve_loss_value = improve_loss.detach().item()
-        dice_gain_value = metric_after["dice"] - metric_before["dice"]
+        metric_before = compute_segmentation_metrics(outputs_before["logits"].detach(), masks)
+        metric_after = compute_segmentation_metrics(outputs_after["logits"].detach(), masks)
+        mem_delta_value = _memory_delta(memory, proposed_memory)
+        mem_norm_value = _memory_norm(proposed_memory)
 
         total_loss_meter.update(float(total_loss.detach().item()), batch_size)
         seg_before_meter.update(seg_before_dict["loss_total"], batch_size)
         seg_after_meter.update(seg_after_dict["loss_total"], batch_size)
-        improve_loss_meter.update(improve_loss_value, batch_size)
-
-        mem_reg_meter.update(mem_reg_value, batch_size)
+        improve_loss_meter.update(float(improve_loss.detach().item()), batch_size)
+        mem_reg_meter.update(float(memory_reg.detach().item()), batch_size)
         mem_delta_meter.update(mem_delta_value, batch_size)
         mem_norm_meter.update(mem_norm_value, batch_size)
-
         dice_before_meter.update(metric_before["dice"], batch_size)
         dice_after_meter.update(metric_after["dice"], batch_size)
-        dice_gain_meter.update(dice_gain_value, batch_size)
+        dice_gain_meter.update(metric_after["dice"] - metric_before["dice"], batch_size)
         iou_after_meter.update(metric_after["iou"], batch_size)
         precision_after_meter.update(metric_after["precision"], batch_size)
         recall_after_meter.update(metric_after["recall"], batch_size)
@@ -221,7 +203,7 @@ def train_one_task_nested(
 
         if (step + 1) % print_freq == 0 or (step + 1) == len(loader):
             print(
-                f"[Nested-Train][Task {task_id}][Epoch {epoch}] "
+                f"[NBM-Train][Task {task_id}][Epoch {epoch}] "
                 f"Step {step+1}/{len(loader)} | "
                 f"loss={total_loss_meter.avg:.4f} | "
                 f"seg_before={seg_before_meter.avg:.4f} | "
@@ -240,8 +222,6 @@ def train_one_task_nested(
     if len(memory_summaries) == 0:
         raise RuntimeError("No memory summaries collected in this epoch.")
 
-    memory_summary = torch.stack(memory_summaries, dim=0).mean(dim=0).detach()
-
     metrics = {
         "loss": total_loss_meter.avg,
         "seg_before": seg_before_meter.avg,
@@ -257,5 +237,4 @@ def train_one_task_nested(
         "precision": precision_after_meter.avg,
         "recall": recall_after_meter.avg,
     }
-
-    return metrics, memory_summary
+    return metrics, _stack_memory_summaries(memory_summaries)
