@@ -32,7 +32,7 @@ def _get_optimizer_lr(optimizer) -> float:
 
 def _build_parser():
     parser = argparse.ArgumentParser(description="Train NBM-PolypNet on Kvasir-style data.")
-    parser.add_argument("--file-path", default="datasets/Kvasir")
+    parser.add_argument("--file-path", default="/kaggle/input/datasets/khanhtranlong/kvasir/datasets/Kvasir")
     parser.add_argument("--save-root", default="outputs/kvasir_nbm_polypnet")
     parser.add_argument("--image-size", type=int, nargs=2, default=(352, 352), metavar=("H", "W"))
     parser.add_argument("--batch-size", type=int, default=8)
