@@ -119,6 +119,9 @@ def train_one_epoch_clean(
     nested_use_meter = AverageMeter()
     nested_delta_meter = AverageMeter()
     prototype_norm_meter = AverageMeter()
+    memory_mix_meter = AverageMeter()
+    memory_entropy_meter = AverageMeter()
+    residual_gate_meter = AverageMeter()
 
     amp_enabled = use_amp and torch.cuda.is_available()
     for step, batch in enumerate(loader):
@@ -177,12 +180,16 @@ def train_one_epoch_clean(
         nested_use_meter.update(float(nested_used), bs)
         nested_delta_meter.update(float(outputs["nested_info"]["delta_mean"].detach().item()), bs)
         prototype_norm_meter.update(float(outputs["nested_info"]["prototype_norm"].detach().item()), bs)
+        memory_mix_meter.update(float(outputs["nested_info"]["memory_mix"].detach().item()), bs)
+        memory_entropy_meter.update(float(outputs["nested_info"]["memory_entropy"].detach().item()), bs)
+        residual_gate_meter.update(float(outputs["nested_info"]["residual_gate"].detach().item()), bs)
 
         if (step + 1) % print_freq == 0 or (step + 1) == len(loader):
             print(
                 f"[Train][Epoch {epoch}] Step {step+1}/{len(loader)} | "
                 f"loss={loss_meter.avg:.4f} | dice={dice_meter.avg:.4f} | iou={iou_meter.avg:.4f} | "
-                f"nested_used={nested_use_meter.avg:.3f} | nested_delta={nested_delta_meter.avg:.5f}"
+                f"nested_used={nested_use_meter.avg:.3f} | nested_delta={nested_delta_meter.avg:.5f} | "
+                f"memory_mix={memory_mix_meter.avg:.3f} | memory_entropy={memory_entropy_meter.avg:.3f}"
             )
 
     return {
@@ -194,6 +201,9 @@ def train_one_epoch_clean(
         "nested_used": nested_use_meter.avg,
         "nested_delta": nested_delta_meter.avg,
         "prototype_norm": prototype_norm_meter.avg,
+        "memory_mix": memory_mix_meter.avg,
+        "memory_entropy": memory_entropy_meter.avg,
+        "residual_gate": residual_gate_meter.avg,
     }
 
 

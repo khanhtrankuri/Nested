@@ -13,6 +13,7 @@ This patch gives you a **simple but stronger baseline** than the current plain U
 - **Strict split or 5-fold CV**
 - **EMA + threshold sweep + optional TTA**
 - **Model selection by IoU first**
+- **Paper-inspired nested memory option**: fast/slow prototype memory with learned gates
 
 ## Files
 - `data/load_data_clean.py`

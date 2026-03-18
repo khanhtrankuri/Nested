@@ -35,6 +35,8 @@ def build_parser():
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
+    parser.add_argument("--nested-memory-hidden", type=int, default=128)
+    parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
     parser.add_argument("--nested-momentum", type=float, default=0.03)
     parser.add_argument("--skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_true")
     parser.add_argument("--no-skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_false")
@@ -127,6 +129,8 @@ def main():
         nested_prototypes=args.nested_prototypes,
         nested_residual_scale=args.nested_residual_scale,
         nested_max_norm=args.nested_max_norm,
+        nested_memory_hidden=args.nested_memory_hidden,
+        nested_slow_momentum_scale=args.nested_slow_momentum_scale,
     ).to(device)
     criterion = StrongBaselineLoss()
     model_kwargs = {
@@ -141,6 +145,8 @@ def main():
         "nested_prototypes": args.nested_prototypes,
         "nested_residual_scale": args.nested_residual_scale,
         "nested_max_norm": args.nested_max_norm,
+        "nested_memory_hidden": args.nested_memory_hidden,
+        "nested_slow_momentum_scale": args.nested_slow_momentum_scale,
     }
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location=device)

@@ -230,6 +230,8 @@ class SafeNestedResidualRefiner(nn.Module):
         num_prototypes: int = 8,
         residual_scale: float = 0.05,
         prototype_max_norm: float = 1.0,
+        memory_hidden_dim: int = 128,
+        slow_momentum_scale: float = 0.25,
         init_std: float = 0.02,
     ):
         super().__init__()
@@ -237,13 +239,22 @@ class SafeNestedResidualRefiner(nn.Module):
         self.num_prototypes = num_prototypes
         self.residual_scale = float(residual_scale)
         self.prototype_max_norm = float(prototype_max_norm)
+        self.slow_momentum_scale = float(slow_momentum_scale)
 
         self.query_proj = nn.Conv2d(feat_channels, nested_dim, kernel_size=1, bias=False)
         self.residual_head = nn.Sequential(
             ConvBNAct(feat_channels + nested_dim + 1, feat_channels),
             nn.Conv2d(feat_channels, 1, kernel_size=1),
         )
-        self.register_buffer("prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
+        gate_in_dim = nested_dim + 4
+        hidden_dim = max(int(memory_hidden_dim), 32)
+        self.memory_gate = nn.Sequential(
+            nn.Linear(gate_in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 4),
+        )
+        self.register_buffer("fast_prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
+        self.register_buffer("slow_prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
 
     def _uncertainty(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
@@ -258,8 +269,34 @@ class SafeNestedResidualRefiner(nn.Module):
         token = token.flatten(1)
         return F.normalize(token, dim=-1)
 
+    def _memory_stats(self, coarse_lowres_logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(coarse_lowres_logits)
+        uncertainty = self._uncertainty(coarse_lowres_logits)
+        foreground_mean = probs.mean(dim=(1, 2, 3))
+        uncertainty_mean = uncertainty.mean(dim=(1, 2, 3))
+        uncertainty_max = uncertainty.amax(dim=(1, 2, 3))
+        logit_energy = coarse_lowres_logits.abs().mean(dim=(1, 2, 3))
+        return torch.stack([foreground_mean, uncertainty_mean, uncertainty_max, logit_energy], dim=-1)
+
+    @staticmethod
+    def _attention_entropy(attn: torch.Tensor) -> torch.Tensor:
+        safe_attn = attn.clamp(min=1e-6)
+        return -(safe_attn * safe_attn.log()).sum(dim=-1)
+
+    def _build_memory_controls(
+        self,
+        token: torch.Tensor,
+        memory_stats: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        gate_input = torch.cat([token, memory_stats], dim=-1)
+        gate_logits = self.memory_gate(gate_input)
+        context_mix = torch.sigmoid(gate_logits[:, 0:1])
+        residual_gate = torch.sigmoid(gate_logits[:, 1:2])
+        fast_update_gate = torch.sigmoid(gate_logits[:, 2:3])
+        slow_update_gate = torch.sigmoid(gate_logits[:, 3:4])
+        return context_mix, residual_gate, fast_update_gate, slow_update_gate
+
     def forward(self, feat: torch.Tensor, coarse_lowres_logits: torch.Tensor, use_nested: bool = True):
-        batch_size = feat.size(0)
         device = feat.device
         dtype = feat.dtype
 
@@ -268,26 +305,57 @@ class SafeNestedResidualRefiner(nn.Module):
             return coarse_lowres_logits, {
                 "used_nested": torch.zeros((), device=device, dtype=dtype),
                 "delta_mean": zero_scalar,
-                "prototype_norm": self.prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean(),
+                "prototype_norm": 0.5
+                * (
+                    self.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+                    + self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+                ),
+                "memory_mix": zero_scalar,
+                "memory_entropy": zero_scalar,
+                "residual_gate": zero_scalar,
+                "fast_update_gate": zero_scalar,
+                "slow_update_gate": zero_scalar,
             }, None
 
         query_feat = self.query_proj(feat)
         token = self._compute_token(query_feat, coarse_lowres_logits)
-        prototypes = F.normalize(self.prototypes.to(device=device, dtype=dtype), dim=-1)
-        attn = torch.softmax(torch.matmul(token, prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
-        context = torch.matmul(attn, prototypes).unsqueeze(-1).unsqueeze(-1)
+        memory_stats = self._memory_stats(coarse_lowres_logits).to(device=device, dtype=dtype)
+        context_mix, residual_gate, fast_update_gate, slow_update_gate = self._build_memory_controls(token, memory_stats)
+
+        fast_prototypes = F.normalize(self.fast_prototypes.to(device=device, dtype=dtype), dim=-1)
+        slow_prototypes = F.normalize(self.slow_prototypes.to(device=device, dtype=dtype), dim=-1)
+        fast_attn = torch.softmax(torch.matmul(token, fast_prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
+        slow_attn = torch.softmax(torch.matmul(token, slow_prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
+        context_fast = torch.matmul(fast_attn, fast_prototypes)
+        context_slow = torch.matmul(slow_attn, slow_prototypes)
+        context = context_mix * context_fast + (1.0 - context_mix) * context_slow
+        context = context.unsqueeze(-1).unsqueeze(-1)
+
         context = context.expand(-1, -1, feat.shape[-2], feat.shape[-1])
         uncertainty = self._uncertainty(coarse_lowres_logits)
         delta = self.residual_head(torch.cat([feat, context, uncertainty], dim=1))
-        refined = coarse_lowres_logits + self.residual_scale * delta
+
+        refined = coarse_lowres_logits + self.residual_scale * residual_gate.unsqueeze(-1) * delta
+        fast_entropy = self._attention_entropy(fast_attn)
+        slow_entropy = self._attention_entropy(slow_attn)
+        memory_entropy = 0.5 * (fast_entropy + slow_entropy)
+
         nested_info = {
             "used_nested": torch.ones((), device=device, dtype=dtype),
             "delta_mean": delta.abs().mean(),
-            "prototype_norm": self.prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean(),
+            "prototype_norm": 0.5 * (self.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean() + self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()),
+            "memory_mix": context_mix.mean(),
+            "memory_entropy": memory_entropy.mean(),
+            "residual_gate": residual_gate.mean(),
+            "fast_update_gate": fast_update_gate.mean(),
+            "slow_update_gate": slow_update_gate.mean(),
         }
         nested_cache = {
             "token": token.detach(),
-            "attn": attn.detach(),
+            "fast_attn": fast_attn.detach(),
+            "slow_attn": slow_attn.detach(),
+            "fast_update_gate": fast_update_gate.detach(),
+            "slow_update_gate": slow_update_gate.detach(),
         }
         return refined, nested_info, nested_cache
 
@@ -296,17 +364,52 @@ class SafeNestedResidualRefiner(nn.Module):
         if nested_cache is None:
             return
         max_norm = self.prototype_max_norm if max_norm is None else float(max_norm)
-        tokens = nested_cache["token"].to(device=self.prototypes.device, dtype=self.prototypes.dtype)
-        assignments = nested_cache["attn"].argmax(dim=-1)
-        for prototype_index in range(self.num_prototypes):
+        tokens = nested_cache["token"].to(device=self.fast_prototypes.device, dtype=self.fast_prototypes.dtype)
+        fast_assignments = nested_cache["fast_attn"].argmax(dim=-1)
+        slow_assignments = nested_cache["slow_attn"].argmax(dim=-1)
+        fast_gates = nested_cache["fast_update_gate"].to(device=self.fast_prototypes.device, dtype=self.fast_prototypes.dtype).flatten()
+        slow_gates = nested_cache["slow_update_gate"].to(device=self.slow_prototypes.device, dtype=self.slow_prototypes.dtype).flatten()
+
+        self._update_memory_bank(
+            bank=self.fast_prototypes,
+            tokens=tokens,
+            assignments=fast_assignments,
+            update_gates=fast_gates,
+            momentum=float(momentum),
+            max_norm=max_norm,
+        )
+        self._update_memory_bank(
+            bank=self.slow_prototypes,
+            tokens=tokens,
+            assignments=slow_assignments,
+            update_gates=slow_gates,
+            momentum=float(momentum) * self.slow_momentum_scale,
+            max_norm=max_norm,
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _update_memory_bank(
+        bank: torch.Tensor,
+        tokens: torch.Tensor,
+        assignments: torch.Tensor,
+        update_gates: torch.Tensor,
+        momentum: float,
+        max_norm: float,
+    ):
+        for prototype_index in range(bank.shape[0]):
             mask = assignments == prototype_index
             if not torch.any(mask):
                 continue
-            target = F.normalize(tokens[mask].mean(dim=0), dim=0)
-            self.prototypes[prototype_index].mul_(1.0 - float(momentum)).add_(float(momentum) * target)
-        norms = self.prototypes.norm(dim=-1, keepdim=True)
+            weights = update_gates[mask]
+            if torch.sum(weights) <= 1e-6:
+                continue
+            weighted_tokens = tokens[mask] * weights.unsqueeze(-1)
+            target = F.normalize(weighted_tokens.sum(dim=0) / weights.sum().clamp(min=1e-6), dim=0)
+            bank[prototype_index].mul_(1.0 - float(momentum)).add_(float(momentum) * target)
+        norms = bank.norm(dim=-1, keepdim=True)
         scale = torch.clamp(max_norm / (norms + 1e-6), max=1.0)
-        self.prototypes.mul_(scale)
+        bank.mul_(scale)
 
 
 class StrongBaselinePolypModel(nn.Module):
@@ -332,6 +435,8 @@ class StrongBaselinePolypModel(nn.Module):
         nested_prototypes: int = 8,
         nested_residual_scale: float = 0.05,
         nested_max_norm: float = 1.0,
+        nested_memory_hidden: int = 128,
+        nested_slow_momentum_scale: float = 0.25,
     ):
         super().__init__()
         self.encoder_name = encoder_name
@@ -356,6 +461,8 @@ class StrongBaselinePolypModel(nn.Module):
             num_prototypes=nested_prototypes,
             residual_scale=nested_residual_scale,
             prototype_max_norm=nested_max_norm,
+            memory_hidden_dim=nested_memory_hidden,
+            slow_momentum_scale=nested_slow_momentum_scale,
         )
 
     def get_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
