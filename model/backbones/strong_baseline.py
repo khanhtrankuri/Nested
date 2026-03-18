@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -221,6 +222,93 @@ class FPNDecoder(nn.Module):
         return self.fuse(fused), s5
 
 
+class SafeNestedResidualRefiner(nn.Module):
+    def __init__(
+        self,
+        feat_channels: int,
+        nested_dim: int = 128,
+        num_prototypes: int = 8,
+        residual_scale: float = 0.05,
+        prototype_max_norm: float = 1.0,
+        init_std: float = 0.02,
+    ):
+        super().__init__()
+        self.nested_dim = nested_dim
+        self.num_prototypes = num_prototypes
+        self.residual_scale = float(residual_scale)
+        self.prototype_max_norm = float(prototype_max_norm)
+
+        self.query_proj = nn.Conv2d(feat_channels, nested_dim, kernel_size=1, bias=False)
+        self.residual_head = nn.Sequential(
+            ConvBNAct(feat_channels + nested_dim + 1, feat_channels),
+            nn.Conv2d(feat_channels, 1, kernel_size=1),
+        )
+        self.register_buffer("prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
+
+    def _uncertainty(self, logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        return 1.0 - torch.abs(2.0 * probs - 1.0)
+
+    def _compute_token(self, query_feat: torch.Tensor, coarse_lowres_logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(coarse_lowres_logits)
+        uncertainty = self._uncertainty(coarse_lowres_logits)
+        focus = 0.70 * probs + 0.30 * uncertainty
+        denom = focus.sum(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+        token = (query_feat * focus).sum(dim=(2, 3), keepdim=True) / denom
+        token = token.flatten(1)
+        return F.normalize(token, dim=-1)
+
+    def forward(self, feat: torch.Tensor, coarse_lowres_logits: torch.Tensor, use_nested: bool = True):
+        batch_size = feat.size(0)
+        device = feat.device
+        dtype = feat.dtype
+
+        if not use_nested:
+            zero_scalar = torch.zeros((), device=device, dtype=dtype)
+            return coarse_lowres_logits, {
+                "used_nested": torch.zeros((), device=device, dtype=dtype),
+                "delta_mean": zero_scalar,
+                "prototype_norm": self.prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean(),
+            }, None
+
+        query_feat = self.query_proj(feat)
+        token = self._compute_token(query_feat, coarse_lowres_logits)
+        prototypes = F.normalize(self.prototypes.to(device=device, dtype=dtype), dim=-1)
+        attn = torch.softmax(torch.matmul(token, prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
+        context = torch.matmul(attn, prototypes).unsqueeze(-1).unsqueeze(-1)
+        context = context.expand(-1, -1, feat.shape[-2], feat.shape[-1])
+        uncertainty = self._uncertainty(coarse_lowres_logits)
+        delta = self.residual_head(torch.cat([feat, context, uncertainty], dim=1))
+        refined = coarse_lowres_logits + self.residual_scale * delta
+        nested_info = {
+            "used_nested": torch.ones((), device=device, dtype=dtype),
+            "delta_mean": delta.abs().mean(),
+            "prototype_norm": self.prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean(),
+        }
+        nested_cache = {
+            "token": token.detach(),
+            "attn": attn.detach(),
+        }
+        return refined, nested_info, nested_cache
+
+    @torch.no_grad()
+    def update_prototypes(self, nested_cache: Optional[Dict[str, torch.Tensor]], momentum: float = 0.03, max_norm: Optional[float] = None):
+        if nested_cache is None:
+            return
+        max_norm = self.prototype_max_norm if max_norm is None else float(max_norm)
+        tokens = nested_cache["token"].to(device=self.prototypes.device, dtype=self.prototypes.dtype)
+        assignments = nested_cache["attn"].argmax(dim=-1)
+        for prototype_index in range(self.num_prototypes):
+            mask = assignments == prototype_index
+            if not torch.any(mask):
+                continue
+            target = F.normalize(tokens[mask].mean(dim=0), dim=0)
+            self.prototypes[prototype_index].mul_(1.0 - float(momentum)).add_(float(momentum) * target)
+        norms = self.prototypes.norm(dim=-1, keepdim=True)
+        scale = torch.clamp(max_norm / (norms + 1e-6), max=1.0)
+        self.prototypes.mul_(scale)
+
+
 class StrongBaselinePolypModel(nn.Module):
     """Clean baseline:
     - pure PyTorch ConvNeXt-like encoder
@@ -239,11 +327,17 @@ class StrongBaselinePolypModel(nn.Module):
         use_pretrained: bool = False,
         strict_pretrained: bool = False,
         pretrained_cache_dir: Optional[str] = None,
+        enable_nested: bool = False,
+        nested_dim: int = 128,
+        nested_prototypes: int = 8,
+        nested_residual_scale: float = 0.05,
+        nested_max_norm: float = 1.0,
     ):
         super().__init__()
         self.encoder_name = encoder_name
         self.use_pretrained = bool(use_pretrained)
         self.strict_pretrained = bool(strict_pretrained)
+        self.enable_nested = bool(enable_nested)
         self.encoder = build_encoder(
             encoder_name=encoder_name,
             in_channels=in_channels,
@@ -256,6 +350,13 @@ class StrongBaselinePolypModel(nn.Module):
         self.dropout = nn.Dropout2d(dropout)
         self.seg_head = nn.Sequential(ConvBNAct(decoder_channels, decoder_channels), nn.Conv2d(decoder_channels, out_channels, 1))
         self.aux_head = nn.Sequential(ConvBNAct(decoder_channels, decoder_channels // 2), nn.Conv2d(decoder_channels // 2, out_channels, 1))
+        self.nested_refiner = SafeNestedResidualRefiner(
+            feat_channels=decoder_channels,
+            nested_dim=nested_dim,
+            num_prototypes=nested_prototypes,
+            residual_scale=nested_residual_scale,
+            prototype_max_norm=nested_max_norm,
+        )
 
     def get_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
         """
@@ -271,16 +372,32 @@ class StrongBaselinePolypModel(nn.Module):
             "decoder": decoder_params,
         }
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, use_nested: bool = False) -> Dict[str, torch.Tensor]:
         input_size = x.shape[-2:]
         c2, c3, c4, c5 = self.encoder(x)
         fused, aux_feat = self.decoder(c2, c3, c4, c5)
         fused = self.dropout(fused)
-        logits = self.seg_head(fused)
+        coarse_lowres_logits = self.seg_head(fused)
+        refined_lowres_logits, nested_info, nested_cache = self.nested_refiner(
+            fused,
+            coarse_lowres_logits,
+            use_nested=bool(use_nested and self.enable_nested),
+        )
         aux_logits = self.aux_head(aux_feat)
-        logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
+        coarse_logits = F.interpolate(coarse_lowres_logits, size=input_size, mode="bilinear", align_corners=False)
+        logits = F.interpolate(refined_lowres_logits, size=input_size, mode="bilinear", align_corners=False)
         aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
-        return {"logits": logits, "aux_logits": aux_logits}
+        return {
+            "coarse_logits": coarse_logits,
+            "logits": logits,
+            "aux_logits": aux_logits,
+            "nested_info": nested_info,
+            "nested_cache": nested_cache,
+        }
+
+    @torch.no_grad()
+    def update_nested_prototypes(self, nested_cache: Optional[Dict[str, torch.Tensor]], momentum: float = 0.03, max_norm: Optional[float] = None):
+        self.nested_refiner.update_prototypes(nested_cache, momentum=momentum, max_norm=max_norm)
 
     @torch.no_grad()
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:

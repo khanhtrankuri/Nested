@@ -44,20 +44,27 @@ class ModelEMA:
                 v.mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
 
 
-def _forward_with_tta(model, images: torch.Tensor):
+def _forward_with_tta(model, images: torch.Tensor, use_nested: bool = False):
     outputs = []
-    logits = model(images)["logits"]
+    logits = model(images, use_nested=use_nested)["logits"]
     outputs.append(logits)
 
     h = torch.flip(images, dims=[3])
-    outputs.append(torch.flip(model(h)["logits"], dims=[3]))
+    outputs.append(torch.flip(model(h, use_nested=use_nested)["logits"], dims=[3]))
 
     v = torch.flip(images, dims=[2])
-    outputs.append(torch.flip(model(v)["logits"], dims=[2]))
+    outputs.append(torch.flip(model(v, use_nested=use_nested)["logits"], dims=[2]))
 
     hv = torch.flip(images, dims=[2, 3])
-    outputs.append(torch.flip(model(hv)["logits"], dims=[2, 3]))
+    outputs.append(torch.flip(model(hv, use_nested=use_nested)["logits"], dims=[2, 3]))
     return torch.stack(outputs, dim=0).mean(dim=0)
+
+
+def _select_primary_outputs(outputs: Dict[str, torch.Tensor], use_coarse: bool = False) -> Dict[str, torch.Tensor]:
+    selected = dict(outputs)
+    if use_coarse and "coarse_logits" in outputs:
+        selected["logits"] = outputs["coarse_logits"]
+    return selected
 
 
 def train_one_epoch_clean(
@@ -72,6 +79,11 @@ def train_one_epoch_clean(
     grad_clip: Optional[float] = 1.0,
     ema: Optional[ModelEMA] = None,
     print_freq: int = 20,
+    use_nested: bool = False,
+    skip_nested_if_hurts: bool = True,
+    nested_skip_margin: float = 0.002,
+    nested_momentum: float = 0.03,
+    nested_max_norm: float = 1.0,
 ) -> Dict[str, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -79,6 +91,9 @@ def train_one_epoch_clean(
     iou_meter = AverageMeter()
     precision_meter = AverageMeter()
     recall_meter = AverageMeter()
+    nested_use_meter = AverageMeter()
+    nested_delta_meter = AverageMeter()
+    prototype_norm_meter = AverageMeter()
 
     amp_enabled = use_amp and torch.cuda.is_available()
     for step, batch in enumerate(loader):
@@ -87,8 +102,27 @@ def train_one_epoch_clean(
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=amp_enabled):
-            outputs = model(images)
-            loss, loss_dict = criterion(outputs, masks, return_components=True)
+            outputs = model(images, use_nested=use_nested)
+            nested_available = bool(outputs.get("nested_cache") is not None)
+            if nested_available:
+                base_outputs = _select_primary_outputs(outputs, use_coarse=True)
+                base_loss, base_loss_dict = criterion(base_outputs, masks, return_components=True)
+                nested_loss, nested_loss_dict = criterion(outputs, masks, return_components=True)
+                nested_hurts = bool((nested_loss.detach() > base_loss.detach() + nested_skip_margin).item())
+                if skip_nested_if_hurts and nested_hurts:
+                    chosen_outputs = base_outputs
+                    loss = base_loss
+                    loss_dict = base_loss_dict
+                    nested_used = False
+                else:
+                    chosen_outputs = outputs
+                    loss = nested_loss
+                    loss_dict = nested_loss_dict
+                    nested_used = True
+            else:
+                chosen_outputs = outputs
+                loss, loss_dict = criterion(outputs, masks, return_components=True)
+                nested_used = False
 
         if scaler is not None and amp_enabled:
             scaler.scale(loss).backward()
@@ -103,21 +137,27 @@ def train_one_epoch_clean(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
+        if use_nested and nested_used:
+            model.update_nested_prototypes(outputs["nested_cache"], momentum=nested_momentum, max_norm=nested_max_norm)
         if ema is not None:
             ema.update(model)
 
-        metric_dict = compute_segmentation_metrics(outputs["logits"].detach(), masks)
+        metric_dict = compute_segmentation_metrics(chosen_outputs["logits"].detach(), masks)
         bs = images.size(0)
         loss_meter.update(loss_dict["loss_total"], bs)
         dice_meter.update(metric_dict["dice"], bs)
         iou_meter.update(metric_dict["iou"], bs)
         precision_meter.update(metric_dict["precision"], bs)
         recall_meter.update(metric_dict["recall"], bs)
+        nested_use_meter.update(float(nested_used), bs)
+        nested_delta_meter.update(float(outputs["nested_info"]["delta_mean"].detach().item()), bs)
+        prototype_norm_meter.update(float(outputs["nested_info"]["prototype_norm"].detach().item()), bs)
 
         if (step + 1) % print_freq == 0 or (step + 1) == len(loader):
             print(
                 f"[Train][Epoch {epoch}] Step {step+1}/{len(loader)} | "
-                f"loss={loss_meter.avg:.4f} | dice={dice_meter.avg:.4f} | iou={iou_meter.avg:.4f}"
+                f"loss={loss_meter.avg:.4f} | dice={dice_meter.avg:.4f} | iou={iou_meter.avg:.4f} | "
+                f"nested_used={nested_use_meter.avg:.3f} | nested_delta={nested_delta_meter.avg:.5f}"
             )
 
     return {
@@ -126,6 +166,9 @@ def train_one_epoch_clean(
         "iou": iou_meter.avg,
         "precision": precision_meter.avg,
         "recall": recall_meter.avg,
+        "nested_used": nested_use_meter.avg,
+        "nested_delta": nested_delta_meter.avg,
+        "prototype_norm": prototype_norm_meter.avg,
     }
 
 
@@ -140,6 +183,7 @@ def evaluate_clean(
     threshold: float = 0.5,
     use_tta: bool = False,
     print_freq: int = 20,
+    use_nested: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     loss_meter = AverageMeter()
@@ -154,8 +198,8 @@ def evaluate_clean(
         masks = batch["mask"].to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=amp_enabled):
-            outputs = model(images)
-            logits = _forward_with_tta(model, images) if use_tta else outputs["logits"]
+            outputs = model(images, use_nested=use_nested)
+            logits = _forward_with_tta(model, images, use_nested=use_nested) if use_tta else outputs["logits"]
             loss, _ = criterion({"logits": logits}, masks, return_components=True)
 
         metric_dict = compute_segmentation_metrics(logits, masks, threshold=threshold)
@@ -179,6 +223,7 @@ def evaluate_clean(
         "precision": precision_meter.avg,
         "recall": recall_meter.avg,
         "threshold": threshold,
+        "use_nested": bool(use_nested),
     }
 
 
@@ -191,6 +236,7 @@ def threshold_sweep_clean(
     thresholds: Iterable[float],
     use_amp: bool = True,
     use_tta: bool = False,
+    use_nested: bool = False,
 ) -> Dict[str, float]:
     best_result = None
     for threshold in thresholds:
@@ -203,6 +249,7 @@ def threshold_sweep_clean(
             use_amp=use_amp,
             use_tta=use_tta,
             print_freq=max(len(loader), 1),
+            use_nested=use_nested,
         )
         if best_result is None:
             best_result = result
@@ -224,6 +271,7 @@ def test_clean(
     threshold: float = 0.5,
     use_amp: bool = True,
     use_tta: bool = True,
+    use_nested: bool = False,
 ) -> Dict[str, float]:
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -236,5 +284,6 @@ def test_clean(
         use_amp=use_amp,
         use_tta=use_tta,
         print_freq=max(len(loader), 1),
+        use_nested=use_nested,
     )
     return result

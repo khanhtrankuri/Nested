@@ -28,6 +28,18 @@ def build_parser():
     parser.add_argument("--pretrained-cache-dir", default="")
     parser.add_argument("--decoder-channels", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--init-checkpoint", default="")
+    parser.add_argument("--enable-nested", action="store_true")
+    parser.add_argument("--nested-start-epoch", type=int, default=20)
+    parser.add_argument("--nested-dim", type=int, default=128)
+    parser.add_argument("--nested-prototypes", type=int, default=8)
+    parser.add_argument("--nested-residual-scale", type=float, default=0.05)
+    parser.add_argument("--nested-max-norm", type=float, default=1.0)
+    parser.add_argument("--nested-momentum", type=float, default=0.03)
+    parser.add_argument("--skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_true")
+    parser.add_argument("--no-skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_false")
+    parser.set_defaults(skip_nested_if_hurts=True)
+    parser.add_argument("--nested-skip-margin", type=float, default=0.002)
     parser.add_argument("--protocol", choices=["strict", "kfold"], default="strict")
     parser.add_argument("--fold-index", type=int, default=0)
     parser.add_argument("--num-folds", type=int, default=5)
@@ -109,6 +121,11 @@ def main():
         pretrained_cache_dir=pretrained_cache_dir,
         decoder_channels=args.decoder_channels,
         dropout=args.dropout,
+        enable_nested=args.enable_nested,
+        nested_dim=args.nested_dim,
+        nested_prototypes=args.nested_prototypes,
+        nested_residual_scale=args.nested_residual_scale,
+        nested_max_norm=args.nested_max_norm,
     ).to(device)
     criterion = StrongBaselineLoss()
     model_kwargs = {
@@ -118,7 +135,20 @@ def main():
         "pretrained_cache_dir": pretrained_cache_dir,
         "decoder_channels": args.decoder_channels,
         "dropout": args.dropout,
+        "enable_nested": args.enable_nested,
+        "nested_dim": args.nested_dim,
+        "nested_prototypes": args.nested_prototypes,
+        "nested_residual_scale": args.nested_residual_scale,
+        "nested_max_norm": args.nested_max_norm,
     }
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location=device)
+        state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"[StrongBaseline] Loaded init checkpoint: {args.init_checkpoint} | "
+            f"missing={list(incompatible.missing_keys)} | unexpected={list(incompatible.unexpected_keys)}"
+        )
     meta_info["model"] = {
         **model_kwargs,
         "pretrained_loaded": bool(getattr(model, "pretrained_loaded", False)),
@@ -162,10 +192,12 @@ def main():
 
     best_state = None
     best_val = {"iou": -1.0, "dice": -1.0, "threshold": 0.5}
+    best_nested_active = False
     epochs_without_improve = 0
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        nested_active = bool(args.enable_nested and epoch >= args.nested_start_epoch)
         train_metrics = train_one_epoch_clean(
             model=model,
             loader=train_loader,
@@ -178,6 +210,11 @@ def main():
             grad_clip=1.0,
             ema=ema,
             print_freq=20,
+            use_nested=nested_active,
+            skip_nested_if_hurts=args.skip_nested_if_hurts,
+            nested_skip_margin=args.nested_skip_margin,
+            nested_momentum=args.nested_momentum,
+            nested_max_norm=args.nested_max_norm,
         )
         scheduler.step()
 
@@ -190,12 +227,14 @@ def main():
             thresholds=args.thresholds,
             use_amp=True,
             use_tta=args.use_tta,
+            use_nested=nested_active,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
         history.append({
             "epoch": epoch,
             "lr": current_lr,
+            "nested_active": nested_active,
             "train": train_metrics,
             "val": val_best,
         })
@@ -204,7 +243,7 @@ def main():
             f"\n[Epoch {epoch}] lr={current_lr:.7f} | "
             f"train_iou={train_metrics['iou']:.4f} | "
             f"val_iou={val_best['iou']:.4f} | val_dice={val_best['dice']:.4f} | "
-            f"best_thr={val_best['threshold']:.2f}\n"
+            f"best_thr={val_best['threshold']:.2f} | nested_active={nested_active}\n"
         )
 
         improved = False
@@ -215,11 +254,13 @@ def main():
 
         if improved:
             best_val = val_best
+            best_nested_active = nested_active
             best_state = copy.deepcopy((ema.ema if ema is not None else model).state_dict())
             torch.save(
                 {
                     "state_dict": best_state,
                     "best_val": best_val,
+                    "best_nested_active": best_nested_active,
                     "model_kwargs": model_kwargs,
                     "train_config": vars(args),
                 },
@@ -249,6 +290,7 @@ def main():
         threshold=best_val["threshold"],
         use_amp=True,
         use_tta=args.use_tta,
+        use_nested=best_nested_active,
     )
 
     with open(os.path.join(args.save_root, "test_metrics.json"), "w", encoding="utf-8") as f:
@@ -257,6 +299,7 @@ def main():
     print(f"Best validation IoU: {best_val['iou']:.4f}")
     print(f"Best validation Dice: {best_val['dice']:.4f}")
     print(f"Best threshold: {best_val['threshold']:.2f}")
+    print(f"Best nested active: {best_nested_active}")
     print(f"Test IoU: {test_metrics['iou']:.4f}")
     print(f"Test Dice: {test_metrics['dice']:.4f}")
 
