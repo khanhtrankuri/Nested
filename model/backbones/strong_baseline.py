@@ -233,7 +233,10 @@ class SafeNestedResidualRefiner(nn.Module):
         memory_mode: str = "fast_slow",
         memory_hidden_dim: int = 128,
         slow_momentum_scale: float = 0.25,
-        init_std: float = 0.02,
+        uncertainty_floor: float = 0.15,
+        memory_quality_threshold: float = 0.35,
+        min_foreground_ratio: float = 0.002,
+        max_foreground_ratio: float = 0.80,
     ):
         super().__init__()
         if memory_mode not in {"fast_slow", "slow_only"}:
@@ -244,6 +247,10 @@ class SafeNestedResidualRefiner(nn.Module):
         self.prototype_max_norm = float(prototype_max_norm)
         self.memory_mode = memory_mode
         self.slow_momentum_scale = float(slow_momentum_scale)
+        self.uncertainty_floor = float(uncertainty_floor)
+        self.memory_quality_threshold = float(memory_quality_threshold)
+        self.min_foreground_ratio = float(min_foreground_ratio)
+        self.max_foreground_ratio = float(max_foreground_ratio)
 
         self.query_proj = nn.Conv2d(feat_channels, nested_dim, kernel_size=1, bias=False)
         self.residual_head = nn.Sequential(
@@ -257,8 +264,10 @@ class SafeNestedResidualRefiner(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 4),
         )
-        self.register_buffer("fast_prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
-        self.register_buffer("slow_prototypes", torch.randn(num_prototypes, nested_dim) * init_std)
+        self.register_buffer("fast_prototypes", torch.zeros(num_prototypes, nested_dim))
+        self.register_buffer("slow_prototypes", torch.zeros(num_prototypes, nested_dim))
+        self.register_buffer("fast_counts", torch.zeros(num_prototypes))
+        self.register_buffer("slow_counts", torch.zeros(num_prototypes))
 
     def _uncertainty(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
@@ -282,10 +291,45 @@ class SafeNestedResidualRefiner(nn.Module):
         logit_energy = coarse_lowres_logits.abs().mean(dim=(1, 2, 3))
         return torch.stack([foreground_mean, uncertainty_mean, uncertainty_max, logit_energy], dim=-1)
 
+    def _memory_quality(self, memory_stats: torch.Tensor) -> torch.Tensor:
+        foreground_mean = memory_stats[:, 0]
+        uncertainty_mean = memory_stats[:, 1]
+        in_range = (foreground_mean >= self.min_foreground_ratio) & (foreground_mean <= self.max_foreground_ratio)
+        confident = uncertainty_mean <= self.memory_quality_threshold
+        return (in_range & confident).float().unsqueeze(-1)
+
     @staticmethod
     def _attention_entropy(attn: torch.Tensor) -> torch.Tensor:
         safe_attn = attn.clamp(min=1e-6)
         return -(safe_attn * safe_attn.log()).sum(dim=-1)
+
+    @staticmethod
+    def _memory_ready_mask(counts: torch.Tensor, min_count: float = 1e-6) -> torch.Tensor:
+        return counts > min_count
+
+    def _attend_memory(
+        self,
+        token: torch.Tensor,
+        bank: torch.Tensor,
+        counts: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ready_mask = self._memory_ready_mask(counts).to(device=device)
+        if not bool(torch.any(ready_mask).item()):
+            zero_attn = torch.zeros(token.size(0), bank.size(0), device=device, dtype=dtype)
+            zero_entropy = torch.zeros(token.size(0), device=device, dtype=dtype)
+            return token, zero_attn, zero_entropy
+
+        normalized_bank = F.normalize(bank[ready_mask].to(device=device, dtype=dtype), dim=-1)
+        attn_logits = torch.matmul(token, normalized_bank.t()) / math.sqrt(self.nested_dim)
+        ready_attn = torch.softmax(attn_logits, dim=-1)
+        context = torch.matmul(ready_attn, normalized_bank)
+
+        full_attn = torch.zeros(token.size(0), bank.size(0), device=device, dtype=dtype)
+        full_attn[:, ready_mask] = ready_attn
+        entropy = self._attention_entropy(ready_attn)
+        return context, full_attn, entropy
 
     def _build_memory_controls(
         self,
@@ -316,6 +360,8 @@ class SafeNestedResidualRefiner(nn.Module):
                 ),
                 "memory_mix": zero_scalar,
                 "memory_entropy": zero_scalar,
+                "memory_quality": zero_scalar,
+                "memory_ready_ratio": zero_scalar,
                 "residual_gate": zero_scalar,
                 "fast_update_gate": zero_scalar,
                 "slow_update_gate": zero_scalar,
@@ -324,14 +370,25 @@ class SafeNestedResidualRefiner(nn.Module):
         query_feat = self.query_proj(feat)
         token = self._compute_token(query_feat, coarse_lowres_logits)
         memory_stats = self._memory_stats(coarse_lowres_logits).to(device=device, dtype=dtype)
+        memory_quality = self._memory_quality(memory_stats).to(device=device, dtype=dtype)
         context_mix, residual_gate, fast_update_gate, slow_update_gate = self._build_memory_controls(token, memory_stats)
+        fast_update_gate = fast_update_gate * memory_quality
+        slow_update_gate = slow_update_gate * memory_quality
 
-        fast_prototypes = F.normalize(self.fast_prototypes.to(device=device, dtype=dtype), dim=-1)
-        slow_prototypes = F.normalize(self.slow_prototypes.to(device=device, dtype=dtype), dim=-1)
-        fast_attn = torch.softmax(torch.matmul(token, fast_prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
-        slow_attn = torch.softmax(torch.matmul(token, slow_prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
-        context_fast = torch.matmul(fast_attn, fast_prototypes)
-        context_slow = torch.matmul(slow_attn, slow_prototypes)
+        context_fast, fast_attn, fast_entropy = self._attend_memory(
+            token,
+            bank=self.fast_prototypes,
+            counts=self.fast_counts,
+            device=device,
+            dtype=dtype,
+        )
+        context_slow, slow_attn, slow_entropy = self._attend_memory(
+            token,
+            bank=self.slow_prototypes,
+            counts=self.slow_counts,
+            device=device,
+            dtype=dtype,
+        )
         if self.memory_mode == "slow_only":
             context_mix = torch.zeros_like(context_mix)
             fast_update_gate = torch.zeros_like(fast_update_gate)
@@ -342,16 +399,19 @@ class SafeNestedResidualRefiner(nn.Module):
 
         context = context.expand(-1, -1, feat.shape[-2], feat.shape[-1])
         uncertainty = self._uncertainty(coarse_lowres_logits)
+        uncertainty_gate = torch.clamp(
+            (uncertainty - self.uncertainty_floor) / max(1.0 - self.uncertainty_floor, 1e-6),
+            min=0.0,
+            max=1.0,
+        )
         delta = self.residual_head(torch.cat([feat, context, uncertainty], dim=1))
         residual_gate_map = residual_gate.view(-1, 1, 1, 1)
-        refined = coarse_lowres_logits + self.residual_scale * residual_gate_map * delta
+        refined = coarse_lowres_logits + self.residual_scale * residual_gate_map * uncertainty_gate * delta
         if refined.shape[1] != coarse_lowres_logits.shape[1]:
             raise RuntimeError(
                 "Nested refiner changed the channel dimension unexpectedly: "
                 f"coarse={tuple(coarse_lowres_logits.shape)}, refined={tuple(refined.shape)}"
             )
-        fast_entropy = self._attention_entropy(fast_attn)
-        slow_entropy = self._attention_entropy(slow_attn)
         if self.memory_mode == "slow_only":
             fast_entropy = torch.zeros_like(slow_entropy)
         memory_entropy = 0.5 * (fast_entropy + slow_entropy)
@@ -362,6 +422,12 @@ class SafeNestedResidualRefiner(nn.Module):
             "prototype_norm": 0.5 * (self.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean() + self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()),
             "memory_mix": context_mix.mean(),
             "memory_entropy": memory_entropy.mean(),
+            "memory_quality": memory_quality.mean(),
+            "memory_ready_ratio": 0.5
+            * (
+                self._memory_ready_mask(self.fast_counts).float().mean().to(device=device, dtype=dtype)
+                + self._memory_ready_mask(self.slow_counts).float().mean().to(device=device, dtype=dtype)
+            ),
             "residual_gate": residual_gate.mean(),
             "fast_update_gate": fast_update_gate.mean(),
             "slow_update_gate": slow_update_gate.mean(),
@@ -389,6 +455,7 @@ class SafeNestedResidualRefiner(nn.Module):
         if self.memory_mode != "slow_only":
             self._update_memory_bank(
                 bank=self.fast_prototypes,
+                counts=self.fast_counts,
                 tokens=tokens,
                 assignments=fast_assignments,
                 update_gates=fast_gates,
@@ -397,6 +464,7 @@ class SafeNestedResidualRefiner(nn.Module):
             )
         self._update_memory_bank(
             bank=self.slow_prototypes,
+            counts=self.slow_counts,
             tokens=tokens,
             assignments=slow_assignments,
             update_gates=slow_gates,
@@ -408,6 +476,7 @@ class SafeNestedResidualRefiner(nn.Module):
     @torch.no_grad()
     def _update_memory_bank(
         bank: torch.Tensor,
+        counts: torch.Tensor,
         tokens: torch.Tensor,
         assignments: torch.Tensor,
         update_gates: torch.Tensor,
@@ -424,6 +493,7 @@ class SafeNestedResidualRefiner(nn.Module):
             weighted_tokens = tokens[mask] * weights.unsqueeze(-1)
             target = F.normalize(weighted_tokens.sum(dim=0) / weights.sum().clamp(min=1e-6), dim=0)
             bank[prototype_index].mul_(1.0 - float(momentum)).add_(float(momentum) * target)
+            counts[prototype_index].add_(float(weights.mean().item()))
         norms = bank.norm(dim=-1, keepdim=True)
         scale = torch.clamp(max_norm / (norms + 1e-6), max=1.0)
         bank.mul_(scale)

@@ -33,7 +33,7 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--small-polyp-sampling-power", type=float, default=0.35)
-    parser.add_argument("--nested-start-epoch", type=int, default=1)
+    parser.add_argument("--nested-start-epoch", type=int, default=8)
     parser.add_argument("--nested-dim", type=int, default=128)
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)

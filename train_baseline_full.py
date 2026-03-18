@@ -34,7 +34,7 @@ def build_parser():
     parser.add_argument("--init-checkpoint", default="")
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--enable-nested", action="store_true")
-    parser.add_argument("--nested-start-epoch", type=int, default=1)
+    parser.add_argument("--nested-start-epoch", type=int, default=8)
     parser.add_argument("--nested-dim", type=int, default=128)
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)
@@ -341,6 +341,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

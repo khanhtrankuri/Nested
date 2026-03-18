@@ -87,6 +87,8 @@ class StrongBaselineLoss(nn.Module):
         focal_tversky_weight: float = 0.25,
         dice_weight: float = 0.15,
         aux_weight: float = 0.10,
+        coarse_weight: float = 0.08,
+        trust_weight: float = 0.04,
     ):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
@@ -98,14 +100,18 @@ class StrongBaselineLoss(nn.Module):
         self.focal_tversky_weight = focal_tversky_weight
         self.dice_weight = dice_weight
         self.aux_weight = aux_weight
+        self.coarse_weight = coarse_weight
+        self.trust_weight = trust_weight
 
     def forward(self, outputs, targets: torch.Tensor, return_components: bool = False):
         if isinstance(outputs, dict):
             logits = outputs["logits"]
             aux_logits = outputs.get("aux_logits")
+            coarse_logits = outputs.get("coarse_logits")
         else:
             logits = outputs
             aux_logits = None
+            coarse_logits = None
 
         loss_bce = self.bce(logits, targets)
         loss_lovasz = self.lovasz(logits, targets)
@@ -115,6 +121,18 @@ class StrongBaselineLoss(nn.Module):
             loss_aux = 0.5 * self.bce(aux_logits, targets) + 0.5 * self.dice(aux_logits, targets)
         else:
             loss_aux = logits.sum() * 0.0
+        if coarse_logits is not None:
+            loss_coarse = 0.5 * self.bce(coarse_logits, targets) + 0.5 * self.dice(coarse_logits, targets)
+            with torch.no_grad():
+                coarse_probs = torch.sigmoid(coarse_logits)
+                coarse_uncertainty = 1.0 - torch.abs(2.0 * coarse_probs - 1.0)
+                confidence = 1.0 - coarse_uncertainty
+            refined_probs = torch.sigmoid(logits)
+            trust_denom = confidence.sum().clamp(min=1e-6)
+            loss_trust = (torch.abs(refined_probs - coarse_probs.detach()) * confidence).sum() / trust_denom
+        else:
+            loss_coarse = logits.sum() * 0.0
+            loss_trust = logits.sum() * 0.0
 
         total = (
             self.bce_weight * loss_bce
@@ -122,6 +140,8 @@ class StrongBaselineLoss(nn.Module):
             + self.focal_tversky_weight * loss_ft
             + self.dice_weight * loss_dice
             + self.aux_weight * loss_aux
+            + self.coarse_weight * loss_coarse
+            + self.trust_weight * loss_trust
         )
         if not return_components:
             return total
@@ -132,4 +152,6 @@ class StrongBaselineLoss(nn.Module):
             "loss_focal_tversky": float(loss_ft.detach().item()),
             "loss_dice": float(loss_dice.detach().item()),
             "loss_aux": float(loss_aux.detach().item()),
+            "loss_coarse": float(loss_coarse.detach().item()),
+            "loss_trust": float(loss_trust.detach().item()),
         }
