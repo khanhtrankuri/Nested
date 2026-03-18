@@ -16,7 +16,7 @@ from model.backbones.strong_baseline import StrongBaselinePolypModel
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Test clean strong baseline on a standalone test split")
-    parser.add_argument("--file-path", default="datasets/Kvasir/test")
+    parser.add_argument("--file-path", "--test-file-path", dest="file_path", default="datasets/Kvasir/test")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--save-root", default="outputs/kvasir_clean_test")
     parser.add_argument("--image-size", type=int, nargs=2, default=None, metavar=("H", "W"))
@@ -38,7 +38,7 @@ def build_parser():
     parser.add_argument("--strict-load", action="store_true")
 
     # Fallback model config if checkpoint does not carry model_kwargs.
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base"], default="convnext_tiny")
     parser.add_argument("--decoder-channels", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--enable-nested", action="store_true")
@@ -100,8 +100,19 @@ def _infer_model_kwargs_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> 
         encoder_channels = int(lateral5_weight.shape[1])
         if encoder_channels == 512:
             inferred["encoder_name"] = "tiny_convnext"
+        elif encoder_channels == 1024:
+            inferred["encoder_name"] = "convnext_base"
         elif encoder_channels == 768:
-            inferred["encoder_name"] = "convnext_tiny"
+            stage3_block_indices = set()
+            for key in state_dict.keys():
+                for prefix in ("encoder.features.5.", "features.5."):
+                    if not key.startswith(prefix):
+                        continue
+                    block_index = key[len(prefix):].split(".", 1)[0]
+                    if block_index.isdigit():
+                        stage3_block_indices.add(int(block_index))
+                    break
+            inferred["encoder_name"] = "convnext_small" if len(stage3_block_indices) >= 20 else "convnext_tiny"
     seg_head_weight = state_dict.get("seg_head.1.weight")
     if isinstance(seg_head_weight, torch.Tensor) and seg_head_weight.ndim == 4:
         inferred["decoder_channels"] = int(seg_head_weight.shape[1])

@@ -23,7 +23,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small"], default="convnext_small")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small","convnext_base"], default="convnext_small")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--decoder-channels", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)

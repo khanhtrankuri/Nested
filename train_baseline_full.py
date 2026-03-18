@@ -25,7 +25,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base"], default="convnext_tiny")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")
@@ -96,8 +96,19 @@ def _infer_model_kwargs_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> 
         encoder_channels = int(lateral5_weight.shape[1])
         if encoder_channels == 512:
             inferred["encoder_name"] = "tiny_convnext"
+        elif encoder_channels == 1024:
+            inferred["encoder_name"] = "convnext_base"
         elif encoder_channels == 768:
-            inferred["encoder_name"] = "convnext_tiny"
+            stage3_block_indices = set()
+            for key in state_dict.keys():
+                for prefix in ("encoder.features.5.", "features.5."):
+                    if not key.startswith(prefix):
+                        continue
+                    block_index = key[len(prefix):].split(".", 1)[0]
+                    if block_index.isdigit():
+                        stage3_block_indices.add(int(block_index))
+                    break
+            inferred["encoder_name"] = "convnext_small" if len(stage3_block_indices) >= 20 else "convnext_tiny"
     seg_head_weight = state_dict.get("seg_head.1.weight")
     if isinstance(seg_head_weight, torch.Tensor) and seg_head_weight.ndim == 4:
         inferred["decoder_channels"] = int(seg_head_weight.shape[1])

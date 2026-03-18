@@ -22,7 +22,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base"], default="convnext_tiny")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")
@@ -172,7 +172,7 @@ def main():
             f"missing={list(incompatible.missing_keys)} | unexpected={list(incompatible.unexpected_keys)}"
         )
     meta_info["model"] = {
-        **model_kwargs,
+        **model_kwargs, 
         "pretrained_loaded": bool(getattr(model, "pretrained_loaded", False)),
     }
     with open(os.path.join(args.save_root, "meta_info.json"), "w", encoding="utf-8") as f:

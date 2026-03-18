@@ -101,8 +101,10 @@ class TorchvisionConvNeXtEncoder(nn.Module):
 
         try:
             from torchvision.models import (
+                ConvNeXt_Base_Weights,
                 ConvNeXt_Small_Weights,
                 ConvNeXt_Tiny_Weights,
+                convnext_base,
                 convnext_small,
                 convnext_tiny,
             )
@@ -110,13 +112,14 @@ class TorchvisionConvNeXtEncoder(nn.Module):
             raise ImportError("Torchvision ConvNeXt encoder requires torchvision to be installed.") from exc
 
         builders = {
-            "convnext_tiny": (convnext_tiny, ConvNeXt_Tiny_Weights.DEFAULT),
-            "convnext_small": (convnext_small, ConvNeXt_Small_Weights.DEFAULT),
+            "convnext_tiny": (convnext_tiny, ConvNeXt_Tiny_Weights.DEFAULT, [96, 192, 384, 768]),
+            "convnext_small": (convnext_small, ConvNeXt_Small_Weights.DEFAULT, [96, 192, 384, 768]),
+            "convnext_base": (convnext_base, ConvNeXt_Base_Weights.DEFAULT, [128, 256, 512, 1024]),
         }
         if variant not in builders:
             raise ValueError(f"Unsupported ConvNeXt variant: {variant}")
 
-        builder, default_weights = builders[variant]
+        builder, default_weights, out_channels = builders[variant]
         loaded_pretrained = False
         try:
             old_torch_hub_dir = None
@@ -139,7 +142,7 @@ class TorchvisionConvNeXtEncoder(nn.Module):
                 torch.hub.set_dir(old_torch_hub_dir)
 
         self.features = backbone.features
-        self.out_channels = [96, 192, 384, 768]
+        self.out_channels = out_channels
         self.variant = variant
         self.pretrained_loaded = loaded_pretrained
 
@@ -167,7 +170,7 @@ def build_encoder(
         encoder = TinyConvNeXtEncoder(in_channels=in_channels)
         encoder.pretrained_loaded = False
         return encoder
-    if encoder_name in {"convnext_tiny", "convnext_small"}:
+    if encoder_name in {"convnext_tiny", "convnext_small", "convnext_base"}:
         return TorchvisionConvNeXtEncoder(
             variant=encoder_name,
             in_channels=in_channels,
