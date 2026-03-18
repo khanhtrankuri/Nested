@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from typing import Dict, List, Sequence
@@ -48,13 +49,30 @@ def build_parser():
 
 
 def _command_to_string(command: Sequence[str]) -> str:
-    return " ".join(command)
+    return shlex.join(list(command))
 
 
-def _base_train_command(args, save_root: str) -> List[str]:
+def _repo_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_path(path: str, repo_root: str) -> str:
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(repo_root, path))
+
+
+def _validate_existing_path(path: str, label: str):
+    if path and not os.path.exists(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def _base_train_command(args, repo_root: str, save_root: str) -> List[str]:
     command = [
         args.python_bin,
-        "train_baseline_clean.py",
+        os.path.join(repo_root, "train_baseline_clean.py"),
         "--file-path",
         args.file_path,
         "--save-root",
@@ -117,8 +135,8 @@ def _base_train_command(args, save_root: str) -> List[str]:
     return command
 
 
-def _variant_train_command(args, variant: str, save_root: str) -> List[str]:
-    command = _base_train_command(args, save_root)
+def _variant_train_command(args, repo_root: str, variant: str, save_root: str) -> List[str]:
+    command = _base_train_command(args, repo_root, save_root)
     if variant == "baseline":
         command.extend(["--eval-nested-mode", "off", "--test-nested-mode", "off"])
         return command
@@ -151,11 +169,11 @@ def _variant_train_command(args, variant: str, save_root: str) -> List[str]:
     raise ValueError(f"Unsupported ablation variant: {variant}")
 
 
-def _eval_commands(args, checkpoint: str, save_root: str) -> Dict[str, List[str]]:
+def _eval_commands(args, repo_root: str, checkpoint: str, save_root: str) -> Dict[str, List[str]]:
     return {
         "no_tta_nested_auto": [
             args.python_bin,
-            "test_baseline.py",
+            os.path.join(repo_root, "test_baseline.py"),
             "--file-path",
             args.test_file_path,
             "--checkpoint",
@@ -170,7 +188,7 @@ def _eval_commands(args, checkpoint: str, save_root: str) -> Dict[str, List[str]
         ],
         "flip_tta_nested_auto": [
             args.python_bin,
-            "test_baseline.py",
+            os.path.join(repo_root, "test_baseline.py"),
             "--file-path",
             args.test_file_path,
             "--checkpoint",
@@ -187,7 +205,7 @@ def _eval_commands(args, checkpoint: str, save_root: str) -> Dict[str, List[str]
         ],
         "ms_tta_nested_auto": [
             args.python_bin,
-            "test_baseline.py",
+            os.path.join(repo_root, "test_baseline.py"),
             "--file-path",
             args.test_file_path,
             "--checkpoint",
@@ -204,7 +222,7 @@ def _eval_commands(args, checkpoint: str, save_root: str) -> Dict[str, List[str]
         ],
         "ms_tta_nested_off": [
             args.python_bin,
-            "test_baseline.py",
+            os.path.join(repo_root, "test_baseline.py"),
             "--file-path",
             args.test_file_path,
             "--checkpoint",
@@ -223,12 +241,26 @@ def _eval_commands(args, checkpoint: str, save_root: str) -> Dict[str, List[str]
     }
 
 
-def _run_command(command: Sequence[str]):
-    subprocess.run(list(command), check=True)
+def _run_command(command: Sequence[str], cwd: str):
+    subprocess.run(list(command), check=True, cwd=cwd)
 
 
 def main():
     args = build_parser().parse_args()
+    repo_root = _repo_root()
+    args.file_path = _resolve_path(args.file_path, repo_root)
+    args.test_file_path = _resolve_path(args.test_file_path, repo_root)
+    args.save_root = _resolve_path(args.save_root, repo_root)
+    args.eval_checkpoint = _resolve_path(args.eval_checkpoint, repo_root) if args.eval_checkpoint else ""
+    args.init_checkpoint = _resolve_path(args.init_checkpoint, repo_root) if args.init_checkpoint else ""
+
+    _validate_existing_path(args.file_path, "Train file path")
+    _validate_existing_path(args.test_file_path, "Test file path")
+    if args.eval_checkpoint:
+        _validate_existing_path(args.eval_checkpoint, "Eval checkpoint")
+    if args.init_checkpoint:
+        _validate_existing_path(args.init_checkpoint, "Init checkpoint")
+
     os.makedirs(args.save_root, exist_ok=True)
 
     manifest = {
@@ -240,19 +272,19 @@ def main():
     if args.eval_checkpoint:
         eval_root = os.path.join(args.save_root, "standalone_eval")
         os.makedirs(eval_root, exist_ok=True)
-        eval_commands = _eval_commands(args, checkpoint=args.eval_checkpoint, save_root=eval_root)
+        eval_commands = _eval_commands(args, repo_root=repo_root, checkpoint=args.eval_checkpoint, save_root=eval_root)
         manifest["standalone_eval"] = {name: _command_to_string(command) for name, command in eval_commands.items()}
         if args.mode == "run":
             for command in eval_commands.values():
-                _run_command(command)
+                _run_command(command, cwd=repo_root)
 
     if not args.skip_train:
         for variant in args.variants:
             variant_root = os.path.join(args.save_root, variant)
-            train_command = _variant_train_command(args, variant=variant, save_root=variant_root)
+            train_command = _variant_train_command(args, repo_root=repo_root, variant=variant, save_root=variant_root)
             checkpoint_path = os.path.join(variant_root, "best_model.pth")
             eval_root = os.path.join(variant_root, "eval_matrix")
-            eval_commands = _eval_commands(args, checkpoint=checkpoint_path, save_root=eval_root)
+            eval_commands = _eval_commands(args, repo_root=repo_root, checkpoint=checkpoint_path, save_root=eval_root)
 
             manifest["variants"][variant] = {
                 "train": _command_to_string(train_command),
@@ -261,9 +293,9 @@ def main():
             }
 
             if args.mode == "run":
-                _run_command(train_command)
+                _run_command(train_command, cwd=repo_root)
                 for command in eval_commands.values():
-                    _run_command(command)
+                    _run_command(command, cwd=repo_root)
 
     with open(os.path.join(args.save_root, "ablation_plan.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
