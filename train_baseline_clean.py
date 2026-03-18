@@ -35,6 +35,7 @@ def build_parser():
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
+    parser.add_argument("--nested-memory-mode", choices=["fast_slow", "slow_only"], default="fast_slow")
     parser.add_argument("--nested-memory-hidden", type=int, default=128)
     parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
     parser.add_argument("--nested-momentum", type=float, default=0.03)
@@ -53,12 +54,24 @@ def build_parser():
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--use-tta", action="store_true")
     parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--eval-nested-mode", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument("--test-nested-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--small-polyp-sampling-power", type=float, default=0.35)
     parser.add_argument("--stratified-split", dest="stratified_split", action="store_true")
     parser.add_argument("--no-stratified-split", dest="stratified_split", action="store_false")
     parser.set_defaults(stratified_split=True)
     return parser
+
+
+def _resolve_nested_usage(mode: str, nested_active: bool) -> bool:
+    if mode == "auto":
+        return bool(nested_active)
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    raise ValueError(f"Unsupported nested usage mode: {mode}")
 
 
 def _split_param_groups(model):
@@ -129,6 +142,7 @@ def main():
         nested_prototypes=args.nested_prototypes,
         nested_residual_scale=args.nested_residual_scale,
         nested_max_norm=args.nested_max_norm,
+        nested_memory_mode=args.nested_memory_mode,
         nested_memory_hidden=args.nested_memory_hidden,
         nested_slow_momentum_scale=args.nested_slow_momentum_scale,
     ).to(device)
@@ -145,6 +159,7 @@ def main():
         "nested_prototypes": args.nested_prototypes,
         "nested_residual_scale": args.nested_residual_scale,
         "nested_max_norm": args.nested_max_norm,
+        "nested_memory_mode": args.nested_memory_mode,
         "nested_memory_hidden": args.nested_memory_hidden,
         "nested_slow_momentum_scale": args.nested_slow_momentum_scale,
     }
@@ -205,6 +220,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         nested_active = bool(args.enable_nested and epoch >= args.nested_start_epoch)
+        val_nested_active = _resolve_nested_usage(args.eval_nested_mode, nested_active)
         train_metrics = train_one_epoch_clean(
             model=model,
             loader=train_loader,
@@ -235,7 +251,7 @@ def main():
             use_amp=True,
             use_tta=args.use_tta,
             tta_scales=args.tta_scales,
-            use_nested=nested_active,
+            use_nested=val_nested_active,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -243,6 +259,7 @@ def main():
             "epoch": epoch,
             "lr": current_lr,
             "nested_active": nested_active,
+            "val_nested_active": val_nested_active,
             "train": train_metrics,
             "val": val_best,
         })
@@ -251,7 +268,7 @@ def main():
             f"\n[Epoch {epoch}] lr={current_lr:.7f} | "
             f"train_iou={train_metrics['iou']:.4f} | "
             f"val_iou={val_best['iou']:.4f} | val_dice={val_best['dice']:.4f} | "
-            f"best_thr={val_best['threshold']:.2f} | nested_active={nested_active}\n"
+            f"best_thr={val_best['threshold']:.2f} | nested_active={nested_active} | val_nested={val_nested_active}\n"
         )
 
         improved = False
@@ -262,7 +279,7 @@ def main():
 
         if improved:
             best_val = val_best
-            best_nested_active = nested_active
+            best_nested_active = val_nested_active
             best_state = copy.deepcopy((ema.ema if ema is not None else model).state_dict())
             torch.save(
                 {
@@ -289,6 +306,7 @@ def main():
         raise RuntimeError("No best checkpoint saved.")
 
     model.load_state_dict(best_state)
+    test_nested_active = _resolve_nested_usage(args.test_nested_mode, best_nested_active)
     test_metrics = test_clean(
         model=model,
         loader=test_loader,
@@ -299,7 +317,7 @@ def main():
         use_amp=True,
         use_tta=args.use_tta,
         tta_scales=args.tta_scales,
-        use_nested=best_nested_active,
+        use_nested=test_nested_active,
     )
 
     with open(os.path.join(args.save_root, "test_metrics.json"), "w", encoding="utf-8") as f:
@@ -309,6 +327,7 @@ def main():
     print(f"Best validation Dice: {best_val['dice']:.4f}")
     print(f"Best threshold: {best_val['threshold']:.2f}")
     print(f"Best nested active: {best_nested_active}")
+    print(f"Final test nested active: {test_nested_active}")
     print(f"Test IoU: {test_metrics['iou']:.4f}")
     print(f"Test Dice: {test_metrics['dice']:.4f}")
 

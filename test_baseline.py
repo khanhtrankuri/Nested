@@ -46,6 +46,9 @@ def build_parser():
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
+    parser.add_argument("--nested-memory-mode", choices=["fast_slow", "slow_only"], default="fast_slow")
+    parser.add_argument("--nested-memory-hidden", type=int, default=128)
+    parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
     return parser
 
 
@@ -84,6 +87,9 @@ def _default_model_kwargs(args) -> Dict[str, object]:
         "nested_prototypes": args.nested_prototypes,
         "nested_residual_scale": args.nested_residual_scale,
         "nested_max_norm": args.nested_max_norm,
+        "nested_memory_mode": args.nested_memory_mode,
+        "nested_memory_hidden": args.nested_memory_hidden,
+        "nested_slow_momentum_scale": args.nested_slow_momentum_scale,
     }
 
 

@@ -230,15 +230,19 @@ class SafeNestedResidualRefiner(nn.Module):
         num_prototypes: int = 8,
         residual_scale: float = 0.05,
         prototype_max_norm: float = 1.0,
+        memory_mode: str = "fast_slow",
         memory_hidden_dim: int = 128,
         slow_momentum_scale: float = 0.25,
         init_std: float = 0.02,
     ):
         super().__init__()
+        if memory_mode not in {"fast_slow", "slow_only"}:
+            raise ValueError(f"Unsupported memory_mode: {memory_mode}")
         self.nested_dim = nested_dim
         self.num_prototypes = num_prototypes
         self.residual_scale = float(residual_scale)
         self.prototype_max_norm = float(prototype_max_norm)
+        self.memory_mode = memory_mode
         self.slow_momentum_scale = float(slow_momentum_scale)
 
         self.query_proj = nn.Conv2d(feat_channels, nested_dim, kernel_size=1, bias=False)
@@ -328,16 +332,28 @@ class SafeNestedResidualRefiner(nn.Module):
         slow_attn = torch.softmax(torch.matmul(token, slow_prototypes.t()) / math.sqrt(self.nested_dim), dim=-1)
         context_fast = torch.matmul(fast_attn, fast_prototypes)
         context_slow = torch.matmul(slow_attn, slow_prototypes)
-        context = context_mix * context_fast + (1.0 - context_mix) * context_slow
+        if self.memory_mode == "slow_only":
+            context_mix = torch.zeros_like(context_mix)
+            fast_update_gate = torch.zeros_like(fast_update_gate)
+            context = context_slow
+        else:
+            context = context_mix * context_fast + (1.0 - context_mix) * context_slow
         context = context.unsqueeze(-1).unsqueeze(-1)
 
         context = context.expand(-1, -1, feat.shape[-2], feat.shape[-1])
         uncertainty = self._uncertainty(coarse_lowres_logits)
         delta = self.residual_head(torch.cat([feat, context, uncertainty], dim=1))
-
-        refined = coarse_lowres_logits + self.residual_scale * residual_gate.unsqueeze(-1) * delta
+        residual_gate_map = residual_gate.view(-1, 1, 1, 1)
+        refined = coarse_lowres_logits + self.residual_scale * residual_gate_map * delta
+        if refined.shape[1] != coarse_lowres_logits.shape[1]:
+            raise RuntimeError(
+                "Nested refiner changed the channel dimension unexpectedly: "
+                f"coarse={tuple(coarse_lowres_logits.shape)}, refined={tuple(refined.shape)}"
+            )
         fast_entropy = self._attention_entropy(fast_attn)
         slow_entropy = self._attention_entropy(slow_attn)
+        if self.memory_mode == "slow_only":
+            fast_entropy = torch.zeros_like(slow_entropy)
         memory_entropy = 0.5 * (fast_entropy + slow_entropy)
 
         nested_info = {
@@ -370,14 +386,15 @@ class SafeNestedResidualRefiner(nn.Module):
         fast_gates = nested_cache["fast_update_gate"].to(device=self.fast_prototypes.device, dtype=self.fast_prototypes.dtype).flatten()
         slow_gates = nested_cache["slow_update_gate"].to(device=self.slow_prototypes.device, dtype=self.slow_prototypes.dtype).flatten()
 
-        self._update_memory_bank(
-            bank=self.fast_prototypes,
-            tokens=tokens,
-            assignments=fast_assignments,
-            update_gates=fast_gates,
-            momentum=float(momentum),
-            max_norm=max_norm,
-        )
+        if self.memory_mode != "slow_only":
+            self._update_memory_bank(
+                bank=self.fast_prototypes,
+                tokens=tokens,
+                assignments=fast_assignments,
+                update_gates=fast_gates,
+                momentum=float(momentum),
+                max_norm=max_norm,
+            )
         self._update_memory_bank(
             bank=self.slow_prototypes,
             tokens=tokens,
@@ -435,6 +452,7 @@ class StrongBaselinePolypModel(nn.Module):
         nested_prototypes: int = 8,
         nested_residual_scale: float = 0.05,
         nested_max_norm: float = 1.0,
+        nested_memory_mode: str = "fast_slow",
         nested_memory_hidden: int = 128,
         nested_slow_momentum_scale: float = 0.25,
     ):
@@ -443,6 +461,7 @@ class StrongBaselinePolypModel(nn.Module):
         self.use_pretrained = bool(use_pretrained)
         self.strict_pretrained = bool(strict_pretrained)
         self.enable_nested = bool(enable_nested)
+        self.nested_memory_mode = nested_memory_mode
         self.encoder = build_encoder(
             encoder_name=encoder_name,
             in_channels=in_channels,
@@ -461,6 +480,7 @@ class StrongBaselinePolypModel(nn.Module):
             num_prototypes=nested_prototypes,
             residual_scale=nested_residual_scale,
             prototype_max_norm=nested_max_norm,
+            memory_mode=nested_memory_mode,
             memory_hidden_dim=nested_memory_hidden,
             slow_momentum_scale=nested_slow_momentum_scale,
         )

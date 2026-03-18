@@ -39,6 +39,9 @@ def build_parser():
     parser.add_argument("--nested-prototypes", type=int, default=8)
     parser.add_argument("--nested-residual-scale", type=float, default=0.05)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
+    parser.add_argument("--nested-memory-mode", choices=["fast_slow", "slow_only"], default="fast_slow")
+    parser.add_argument("--nested-memory-hidden", type=int, default=128)
+    parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
     parser.add_argument("--nested-momentum", type=float, default=0.03)
     parser.add_argument("--skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_true")
     parser.add_argument("--no-skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_false")
@@ -50,10 +53,21 @@ def build_parser():
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--use-tta", action="store_true")
     parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0, 0.875, 1.125])
+    parser.add_argument("--test-nested-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--small-polyp-sampling-power", type=float, default=0.35)
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--skip-final-test", action="store_true")
     return parser
+
+
+def _resolve_nested_usage(mode: str, nested_active: bool) -> bool:
+    if mode == "auto":
+        return bool(nested_active)
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    raise ValueError(f"Unsupported nested usage mode: {mode}")
 
 
 def _default_model_kwargs(args) -> Dict[str, object]:
@@ -69,6 +83,9 @@ def _default_model_kwargs(args) -> Dict[str, object]:
         "nested_prototypes": args.nested_prototypes,
         "nested_residual_scale": args.nested_residual_scale,
         "nested_max_norm": args.nested_max_norm,
+        "nested_memory_mode": args.nested_memory_mode,
+        "nested_memory_hidden": args.nested_memory_hidden,
+        "nested_slow_momentum_scale": args.nested_slow_momentum_scale,
     }
 
 
@@ -174,6 +191,9 @@ def main():
         nested_prototypes=int(model_kwargs["nested_prototypes"]),
         nested_residual_scale=float(model_kwargs["nested_residual_scale"]),
         nested_max_norm=float(model_kwargs["nested_max_norm"]),
+        nested_memory_mode=str(model_kwargs.get("nested_memory_mode", "fast_slow")),
+        nested_memory_hidden=int(model_kwargs.get("nested_memory_hidden", 128)),
+        nested_slow_momentum_scale=float(model_kwargs.get("nested_slow_momentum_scale", 0.25)),
     ).to(device)
 
     if args.init_checkpoint:
@@ -296,6 +316,7 @@ def main():
     model.load_state_dict(final_state)
     final_metrics = None
     if test_loader is not None:
+        test_nested_active = _resolve_nested_usage(args.test_nested_mode, final_nested_active)
         final_metrics = test_clean(
             model=model,
             loader=test_loader,
@@ -306,18 +327,20 @@ def main():
             use_amp=True,
             use_tta=args.use_tta,
             tta_scales=args.tta_scales,
-            use_nested=final_nested_active,
+            use_nested=test_nested_active,
         )
         with open(os.path.join(args.save_root, "test_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(final_metrics, f, indent=2)
 
         print(f"Final threshold: {threshold:.2f}")
         print(f"Final nested active: {final_nested_active}")
+        print(f"Final test nested active: {test_nested_active}")
         print(f"Official Test IoU: {final_metrics['iou']:.4f}")
         print(f"Official Test Dice: {final_metrics['dice']:.4f}")
 
 
 if __name__ == "__main__":
     main()
+
 
 
