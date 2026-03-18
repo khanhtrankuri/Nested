@@ -324,11 +324,11 @@ class SafeNestedResidualRefiner(nn.Module):
         normalized_bank = F.normalize(bank[ready_mask].to(device=device, dtype=dtype), dim=-1)
         attn_logits = torch.matmul(token, normalized_bank.t()) / math.sqrt(self.nested_dim)
         ready_attn = torch.softmax(attn_logits, dim=-1)
-        context = torch.matmul(ready_attn, normalized_bank)
+        context = torch.matmul(ready_attn.to(dtype=normalized_bank.dtype), normalized_bank)
 
         full_attn = torch.zeros(token.size(0), bank.size(0), device=device, dtype=dtype)
-        full_attn[:, ready_mask] = ready_attn
-        entropy = self._attention_entropy(ready_attn)
+        full_attn[:, ready_mask] = ready_attn.to(dtype=full_attn.dtype)
+        entropy = self._attention_entropy(ready_attn).to(dtype=dtype)
         return context, full_attn, entropy
 
     def _build_memory_controls(
