@@ -50,6 +50,7 @@ def build_parser():
     parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60])
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--use-tta", action="store_true")
+    parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--small-polyp-sampling-power", type=float, default=0.35)
     parser.add_argument("--stratified-split", dest="stratified_split", action="store_true")
@@ -227,6 +228,7 @@ def main():
             thresholds=args.thresholds,
             use_amp=True,
             use_tta=args.use_tta,
+            tta_scales=args.tta_scales,
             use_nested=nested_active,
         )
 
@@ -290,6 +292,7 @@ def main():
         threshold=best_val["threshold"],
         use_amp=True,
         use_tta=args.use_tta,
+        tta_scales=args.tta_scales,
         use_nested=best_nested_active,
     )
 

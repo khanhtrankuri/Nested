@@ -6,10 +6,9 @@ from typing import Dict, Optional, Sequence, Tuple
 import torch
 from PIL import Image
 from torch.amp import autocast
-from torch.utils.data import DataLoader
 
-from data.load_data_clean import CleanPolypDataset
-from engine.train_eval_clean import AverageMeter
+from data.load_data_clean import build_standalone_loader
+from engine.train_eval_clean import AverageMeter, _forward_with_tta
 from loss.strong_baseline_loss import StrongBaselineLoss
 from metrics.segmentation_metrics import compute_segmentation_metrics
 from model.backbones.strong_baseline import StrongBaselinePolypModel
@@ -28,6 +27,7 @@ def build_parser():
     parser.add_argument("--use-tta", dest="use_tta", action="store_true")
     parser.add_argument("--no-use-tta", dest="use_tta", action="store_false")
     parser.set_defaults(use_tta=None)
+    parser.add_argument("--tta-scales", type=float, nargs="+", default=None)
     parser.add_argument("--use-nested", dest="use_nested", action="store_true")
     parser.add_argument("--no-use-nested", dest="use_nested", action="store_false")
     parser.set_defaults(use_nested=None)
@@ -59,76 +59,16 @@ def _normalize_image_size(image_size: Optional[Sequence[int]]) -> Tuple[int, int
     raise ValueError(f"image_size must be None, int, or (H, W), got: {image_size}")
 
 
-def _validate_pairs(image_dir: str, mask_dir: str):
-    if not os.path.isdir(image_dir):
-        raise FileNotFoundError(f"Image folder not found: {image_dir}")
-    if not os.path.isdir(mask_dir):
-        raise FileNotFoundError(f"Mask folder not found: {mask_dir}")
-
-    image_names = sorted(
-        file_name
-        for file_name in os.listdir(image_dir)
-        if os.path.isfile(os.path.join(image_dir, file_name))
-    )
-    mask_names = sorted(
-        file_name
-        for file_name in os.listdir(mask_dir)
-        if os.path.isfile(os.path.join(mask_dir, file_name))
-    )
-    if not image_names:
-        raise ValueError(f"No test images found in: {image_dir}")
-    if image_names != mask_names:
-        missing_masks = sorted(set(image_names) - set(mask_names))
-        missing_images = sorted(set(mask_names) - set(image_names))
-        raise ValueError(
-            "Image/mask files do not match. "
-            f"Missing masks: {missing_masks[:5]}. "
-            f"Missing images: {missing_images[:5]}."
-        )
-    return image_names
-
-
 def build_test_loader(file_path: str, image_size=(384, 384), batch_size: int = 8, num_workers: int = 4):
-    image_dir = os.path.join(file_path, "images")
-    mask_dir = os.path.join(file_path, "masks")
-    file_names = _validate_pairs(image_dir, mask_dir)
-    dataset = CleanPolypDataset(
-        image_dir=image_dir,
-        mask_dir=mask_dir,
-        file_names=file_names,
+    loader, meta_info = build_standalone_loader(
+        file_path=file_path,
         image_size=image_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
         augment=False,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-    )
-    meta_info = {
-        "file_path": file_path,
-        "num_test": len(dataset),
-        "image_size": list(_normalize_image_size(image_size)),
-    }
+    meta_info["num_test"] = meta_info.pop("num_samples")
     return loader, meta_info
-
-
-def _forward_with_tta(model, images: torch.Tensor, use_nested: bool = False):
-    outputs = []
-    logits = model(images, use_nested=use_nested)["logits"]
-    outputs.append(logits)
-
-    h = torch.flip(images, dims=[3])
-    outputs.append(torch.flip(model(h, use_nested=use_nested)["logits"], dims=[3]))
-
-    v = torch.flip(images, dims=[2])
-    outputs.append(torch.flip(model(v, use_nested=use_nested)["logits"], dims=[2]))
-
-    hv = torch.flip(images, dims=[2, 3])
-    outputs.append(torch.flip(model(hv, use_nested=use_nested)["logits"], dims=[2, 3]))
-    return torch.stack(outputs, dim=0).mean(dim=0)
 
 
 def _default_model_kwargs(args) -> Dict[str, object]:
@@ -147,6 +87,22 @@ def _default_model_kwargs(args) -> Dict[str, object]:
     }
 
 
+def _infer_model_kwargs_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
+    inferred = {}
+    lateral5_weight = state_dict.get("decoder.lateral5.weight")
+    if isinstance(lateral5_weight, torch.Tensor) and lateral5_weight.ndim == 4:
+        encoder_channels = int(lateral5_weight.shape[1])
+        if encoder_channels == 512:
+            inferred["encoder_name"] = "tiny_convnext"
+        elif encoder_channels == 768:
+            inferred["encoder_name"] = "convnext_tiny"
+    seg_head_weight = state_dict.get("seg_head.1.weight")
+    if isinstance(seg_head_weight, torch.Tensor) and seg_head_weight.ndim == 4:
+        inferred["decoder_channels"] = int(seg_head_weight.shape[1])
+    inferred["enable_nested"] = any(key.startswith("nested_refiner.") for key in state_dict.keys())
+    return inferred
+
+
 def _resolve_model_kwargs(args, checkpoint_payload: Dict[str, object]) -> Dict[str, object]:
     resolved = _default_model_kwargs(args)
     checkpoint_model_kwargs = checkpoint_payload.get("model_kwargs", {}) if isinstance(checkpoint_payload, dict) else {}
@@ -154,6 +110,10 @@ def _resolve_model_kwargs(args, checkpoint_payload: Dict[str, object]) -> Dict[s
         if key in {"use_pretrained", "strict_pretrained", "pretrained_cache_dir", "pretrained_loaded"}:
             continue
         resolved[key] = value
+    if not checkpoint_model_kwargs and isinstance(checkpoint_payload, dict):
+        state_dict = checkpoint_payload.get("state_dict")
+        if isinstance(state_dict, dict):
+            resolved.update(_infer_model_kwargs_from_state_dict(state_dict))
     return resolved
 
 
@@ -184,6 +144,15 @@ def _resolve_use_tta(args, checkpoint_payload: Dict[str, object]) -> bool:
     return False
 
 
+def _resolve_tta_scales(args, checkpoint_payload: Dict[str, object]) -> Tuple[float, ...]:
+    if args.tta_scales:
+        return tuple(float(scale) for scale in args.tta_scales)
+    train_config = checkpoint_payload.get("train_config", {}) if isinstance(checkpoint_payload, dict) else {}
+    if isinstance(train_config, dict) and train_config.get("tta_scales"):
+        return tuple(float(scale) for scale in train_config["tta_scales"])
+    return (1.0,)
+
+
 def _resolve_use_nested(args, checkpoint_payload: Dict[str, object], model_kwargs: Dict[str, object]) -> bool:
     if not bool(model_kwargs.get("enable_nested", False)):
         return False
@@ -210,6 +179,7 @@ def run_test(
     device: str,
     threshold: float,
     use_tta: bool,
+    tta_scales: Sequence[float],
     use_nested: bool,
     save_dir: Optional[str] = None,
     max_batches: int = 0,
@@ -234,10 +204,11 @@ def run_test(
         masks = batch["mask"].to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=amp_enabled):
-            logits = _forward_with_tta(model, images, use_nested=use_nested) if use_tta else model(
-                images,
-                use_nested=use_nested,
-            )["logits"]
+            logits = (
+                _forward_with_tta(model, images, use_nested=use_nested, tta_scales=tta_scales)
+                if use_tta
+                else model(images, use_nested=use_nested)["logits"]
+            )
             loss, _ = criterion({"logits": logits}, masks, return_components=True)
 
         metric_dict = compute_segmentation_metrics(logits, masks, threshold=threshold)
@@ -264,6 +235,7 @@ def run_test(
         "recall": recall_meter.avg,
         "threshold": float(threshold),
         "use_tta": bool(use_tta),
+        "tta_scales": [float(scale) for scale in tta_scales],
         "use_nested": bool(use_nested),
         "num_batches": int(total_steps),
     }
@@ -281,6 +253,7 @@ def main():
     image_size = _resolve_image_size(args, checkpoint_payload if isinstance(checkpoint_payload, dict) else {})
     threshold = _resolve_threshold(args, checkpoint_payload if isinstance(checkpoint_payload, dict) else {})
     use_tta = _resolve_use_tta(args, checkpoint_payload if isinstance(checkpoint_payload, dict) else {})
+    tta_scales = _resolve_tta_scales(args, checkpoint_payload if isinstance(checkpoint_payload, dict) else {})
     use_nested = _resolve_use_nested(args, checkpoint_payload if isinstance(checkpoint_payload, dict) else {}, model_kwargs)
 
     test_loader, test_meta = build_test_loader(
@@ -307,6 +280,7 @@ def main():
         device=device,
         threshold=threshold,
         use_tta=use_tta,
+        tta_scales=tta_scales,
         use_nested=use_nested,
         save_dir=prediction_dir,
         max_batches=args.max_batches,
@@ -318,6 +292,7 @@ def main():
             "device": device,
             "resolved_threshold": threshold,
             "resolved_use_tta": use_tta,
+            "resolved_tta_scales": list(tta_scales),
             "resolved_use_nested": use_nested,
             "model_kwargs": model_kwargs,
             "save_predictions": bool(args.save_predictions),
@@ -341,6 +316,7 @@ def main():
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Threshold: {test_metrics['threshold']:.2f}")
     print(f"Use TTA: {test_metrics['use_tta']}")
+    print(f"TTA scales: {test_metrics['tta_scales']}")
     print(f"Use nested: {test_metrics['use_nested']}")
 
 

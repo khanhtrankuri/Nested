@@ -378,3 +378,46 @@ def build_clean_dataloaders(
         "small_polyp_sampling_power": float(small_polyp_sampling_power),
     }
     return train_loader, val_loader, test_loader, meta_info
+
+
+def build_standalone_loader(
+    file_path: str,
+    image_size=(384, 384),
+    batch_size: int = 8,
+    num_workers: int = 4,
+    augment: bool = False,
+    small_polyp_sampling_power: float = 0.0,
+):
+    image_dir = os.path.join(file_path, "images")
+    mask_dir = os.path.join(file_path, "masks")
+    file_names = _validate_pairs(image_dir, mask_dir)
+    ratio_dict = _build_ratio_dict(mask_dir, file_names) if (augment and small_polyp_sampling_power > 0) else None
+    dataset = CleanPolypDataset(
+        image_dir=image_dir,
+        mask_dir=mask_dir,
+        file_names=file_names,
+        image_size=image_size,
+        augment=augment,
+    )
+    sampler = None if ratio_dict is None else _build_small_polyp_sampler(
+        file_names=file_names,
+        ratio_dict=ratio_dict,
+        sampling_power=small_polyp_sampling_power,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=bool(augment and sampler is None),
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
+    meta_info = {
+        "file_path": file_path,
+        "num_samples": len(dataset),
+        "image_size": list(_normalize_image_size(image_size)),
+        "augment": bool(augment),
+        "small_polyp_sampling_power": float(small_polyp_sampling_power),
+    }
+    return loader, meta_info

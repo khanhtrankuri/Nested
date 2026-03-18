@@ -2,9 +2,10 @@ import copy
 import json
 import os
 from contextlib import nullcontext
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast
 
 from metrics.segmentation_metrics import compute_segmentation_metrics
@@ -44,19 +45,43 @@ class ModelEMA:
                 v.mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
 
 
-def _forward_with_tta(model, images: torch.Tensor, use_nested: bool = False):
+def _scaled_hw(height: int, width: int, scale: float, divisor: int = 32) -> Tuple[int, int]:
+    if abs(float(scale) - 1.0) < 1e-6:
+        return int(height), int(width)
+    scaled_h = max(divisor, int(round((height * float(scale)) / divisor) * divisor))
+    scaled_w = max(divisor, int(round((width * float(scale)) / divisor) * divisor))
+    return scaled_h, scaled_w
+
+
+def _forward_logits(model, images: torch.Tensor, use_nested: bool = False) -> torch.Tensor:
+    return model(images, use_nested=use_nested)["logits"]
+
+
+def _forward_with_tta(
+    model,
+    images: torch.Tensor,
+    use_nested: bool = False,
+    tta_scales: Optional[Sequence[float]] = None,
+):
+    base_h, base_w = images.shape[-2:]
+    scales = [float(scale) for scale in (tta_scales or [1.0])]
     outputs = []
-    logits = model(images, use_nested=use_nested)["logits"]
-    outputs.append(logits)
 
-    h = torch.flip(images, dims=[3])
-    outputs.append(torch.flip(model(h, use_nested=use_nested)["logits"], dims=[3]))
+    for scale in scales:
+        target_h, target_w = _scaled_hw(base_h, base_w, scale=scale)
+        scaled_images = images
+        if (target_h, target_w) != (base_h, base_w):
+            scaled_images = F.interpolate(images, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
-    v = torch.flip(images, dims=[2])
-    outputs.append(torch.flip(model(v, use_nested=use_nested)["logits"], dims=[2]))
+        for flip_dims in (None, [3], [2], [2, 3]):
+            flipped_images = scaled_images if flip_dims is None else torch.flip(scaled_images, dims=flip_dims)
+            logits = _forward_logits(model, flipped_images, use_nested=use_nested)
+            if flip_dims is not None:
+                logits = torch.flip(logits, dims=flip_dims)
+            if logits.shape[-2:] != (base_h, base_w):
+                logits = F.interpolate(logits, size=(base_h, base_w), mode="bilinear", align_corners=False)
+            outputs.append(logits)
 
-    hv = torch.flip(images, dims=[2, 3])
-    outputs.append(torch.flip(model(hv, use_nested=use_nested)["logits"], dims=[2, 3]))
     return torch.stack(outputs, dim=0).mean(dim=0)
 
 
@@ -182,6 +207,7 @@ def evaluate_clean(
     use_amp: bool = True,
     threshold: float = 0.5,
     use_tta: bool = False,
+    tta_scales: Optional[Sequence[float]] = None,
     print_freq: int = 20,
     use_nested: bool = False,
 ) -> Dict[str, float]:
@@ -198,8 +224,11 @@ def evaluate_clean(
         masks = batch["mask"].to(device, non_blocking=True)
 
         with autocast(device_type="cuda", enabled=amp_enabled):
-            outputs = model(images, use_nested=use_nested)
-            logits = _forward_with_tta(model, images, use_nested=use_nested) if use_tta else outputs["logits"]
+            logits = (
+                _forward_with_tta(model, images, use_nested=use_nested, tta_scales=tta_scales)
+                if use_tta
+                else _forward_logits(model, images, use_nested=use_nested)
+            )
             loss, _ = criterion({"logits": logits}, masks, return_components=True)
 
         metric_dict = compute_segmentation_metrics(logits, masks, threshold=threshold)
@@ -224,6 +253,8 @@ def evaluate_clean(
         "recall": recall_meter.avg,
         "threshold": threshold,
         "use_nested": bool(use_nested),
+        "use_tta": bool(use_tta),
+        "tta_scales": [float(scale) for scale in (tta_scales or [1.0])],
     }
 
 
@@ -236,6 +267,7 @@ def threshold_sweep_clean(
     thresholds: Iterable[float],
     use_amp: bool = True,
     use_tta: bool = False,
+    tta_scales: Optional[Sequence[float]] = None,
     use_nested: bool = False,
 ) -> Dict[str, float]:
     best_result = None
@@ -248,6 +280,7 @@ def threshold_sweep_clean(
             threshold=float(threshold),
             use_amp=use_amp,
             use_tta=use_tta,
+            tta_scales=tta_scales,
             print_freq=max(len(loader), 1),
             use_nested=use_nested,
         )
@@ -271,6 +304,7 @@ def test_clean(
     threshold: float = 0.5,
     use_amp: bool = True,
     use_tta: bool = True,
+    tta_scales: Optional[Sequence[float]] = None,
     use_nested: bool = False,
 ) -> Dict[str, float]:
     if save_dir is not None:
@@ -283,6 +317,7 @@ def test_clean(
         threshold=threshold,
         use_amp=use_amp,
         use_tta=use_tta,
+        tta_scales=tta_scales,
         print_freq=max(len(loader), 1),
         use_nested=use_nested,
     )
