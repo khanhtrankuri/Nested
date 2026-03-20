@@ -22,7 +22,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2"], default="convnext_tiny")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")

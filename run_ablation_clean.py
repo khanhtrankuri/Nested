@@ -23,7 +23,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small","convnext_base"], default="convnext_small")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2"], default="convnext_small")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--decoder-channels", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -42,7 +42,7 @@ def build_parser():
     parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
     parser.add_argument("--nested-momentum", type=float, default=0.03)
     parser.add_argument("--nested-skip-margin", type=float, default=0.002)
-    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60])
+    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65])
     parser.add_argument("--flip-tta-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--ms-tta-scales", type=float, nargs="+", default=[1.0, 0.875, 1.125])
     return parser

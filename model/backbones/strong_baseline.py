@@ -158,6 +158,77 @@ class TorchvisionConvNeXtEncoder(nn.Module):
         return c2, c3, c4, c5
 
 
+class TimmPyramidEncoder(nn.Module):
+    def __init__(
+        self,
+        variant: str = "pvt_v2_b2",
+        in_channels: int = 3,
+        use_pretrained: bool = False,
+        strict_pretrained: bool = False,
+        pretrained_cache_dir: Optional[str] = None,
+    ):
+        super().__init__()
+        try:
+            import timm
+        except ImportError as exc:
+            raise ImportError(f"{variant} encoder requires timm to be installed.") from exc
+
+        create_kwargs = {
+            "pretrained": bool(use_pretrained),
+            "features_only": True,
+            "out_indices": (0, 1, 2, 3),
+            "in_chans": int(in_channels),
+        }
+        loaded_pretrained = False
+        old_hf_home = None
+        old_hf_cache = None
+        try:
+            if pretrained_cache_dir:
+                os.makedirs(pretrained_cache_dir, exist_ok=True)
+                old_hf_home = os.environ.get("HF_HOME")
+                old_hf_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+                os.environ["HF_HOME"] = pretrained_cache_dir
+                os.environ["HUGGINGFACE_HUB_CACHE"] = pretrained_cache_dir
+            model = timm.create_model(variant, **create_kwargs)
+            loaded_pretrained = bool(use_pretrained)
+        except Exception as exc:
+            if not use_pretrained or strict_pretrained:
+                raise
+            print(
+                f"[StrongBaseline] Failed to load pretrained weights for {variant}: {exc}. "
+                "Falling back to random initialization."
+            )
+            create_kwargs["pretrained"] = False
+            model = timm.create_model(variant, **create_kwargs)
+        finally:
+            if pretrained_cache_dir:
+                if old_hf_home is None:
+                    os.environ.pop("HF_HOME", None)
+                else:
+                    os.environ["HF_HOME"] = old_hf_home
+                if old_hf_cache is None:
+                    os.environ.pop("HUGGINGFACE_HUB_CACHE", None)
+                else:
+                    os.environ["HUGGINGFACE_HUB_CACHE"] = old_hf_cache
+
+        if not hasattr(model, "feature_info"):
+            raise AttributeError(f"{variant} did not expose feature_info in timm features_only mode.")
+        out_channels = list(model.feature_info.channels())
+        if len(out_channels) != 4:
+            raise ValueError(f"{variant} expected 4 feature stages, got {out_channels}.")
+
+        self.model = model
+        self.out_channels = out_channels
+        self.variant = variant
+        self.pretrained_loaded = loaded_pretrained
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        outputs = self.model(x)
+        if len(outputs) != 4:
+            raise RuntimeError(f"{self.variant} returned {len(outputs)} feature maps instead of 4.")
+        return tuple(outputs)
+
+
 def build_encoder(
     encoder_name: str,
     in_channels: int = 3,
@@ -173,6 +244,14 @@ def build_encoder(
     if encoder_name in {"convnext_tiny", "convnext_small", "convnext_base"}:
         return TorchvisionConvNeXtEncoder(
             variant=encoder_name,
+            in_channels=in_channels,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+        )
+    if encoder_name == "pvtv2_b2":
+        return TimmPyramidEncoder(
+            variant="pvt_v2_b2",
             in_channels=in_channels,
             use_pretrained=use_pretrained,
             strict_pretrained=strict_pretrained,
@@ -310,6 +389,60 @@ class SafeNestedResidualRefiner(nn.Module):
     def _memory_ready_mask(counts: torch.Tensor, min_count: float = 1e-6) -> torch.Tensor:
         return counts > min_count
 
+    @staticmethod
+    @torch.no_grad()
+    def _bootstrap_memory_bank(
+        bank: torch.Tensor,
+        counts: torch.Tensor,
+        tokens: torch.Tensor,
+        update_gates: torch.Tensor,
+        max_norm: float,
+    ):
+        inactive_slots = torch.nonzero(~SafeNestedResidualRefiner._memory_ready_mask(counts), as_tuple=False).flatten()
+        if inactive_slots.numel() == 0:
+            return
+
+        valid_mask = update_gates > 1e-6
+        if not bool(torch.any(valid_mask).item()):
+            return
+
+        candidate_tokens = F.normalize(tokens[valid_mask], dim=-1)
+        candidate_weights = update_gates[valid_mask]
+        candidate_indices = list(torch.argsort(candidate_weights, descending=True).cpu().tolist())
+        if not candidate_indices:
+            return
+
+        selected_indices = []
+        max_slots = min(int(inactive_slots.numel()), len(candidate_indices))
+        while candidate_indices and len(selected_indices) < max_slots:
+            if not selected_indices:
+                best_choice = candidate_indices.pop(0)
+                selected_indices.append(best_choice)
+                continue
+
+            selected_tokens = candidate_tokens[selected_indices]
+            best_choice = None
+            best_score = None
+            for candidate_index in candidate_indices:
+                similarity = torch.matmul(
+                    candidate_tokens[candidate_index].unsqueeze(0),
+                    selected_tokens.t(),
+                ).amax()
+                score = float(candidate_weights[candidate_index].item()) * (1.0 - float(similarity.item()))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_choice = candidate_index
+            candidate_indices.remove(best_choice)
+            selected_indices.append(best_choice)
+
+        for slot_index, candidate_index in zip(inactive_slots.cpu().tolist(), selected_indices):
+            bank[slot_index].copy_(candidate_tokens[candidate_index])
+            counts[slot_index].fill_(max(float(candidate_weights[candidate_index].item()), 1e-3))
+
+        norms = bank.norm(dim=-1, keepdim=True)
+        scale = torch.clamp(max_norm / (norms + 1e-6), max=1.0)
+        bank.mul_(scale)
+
     def _attend_memory(
         self,
         token: torch.Tensor,
@@ -418,19 +551,27 @@ class SafeNestedResidualRefiner(nn.Module):
         if self.memory_mode == "slow_only":
             fast_entropy = torch.zeros_like(slow_entropy)
         memory_entropy = 0.5 * (fast_entropy + slow_entropy)
+        if self.memory_mode == "slow_only":
+            prototype_norm = self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+            memory_ready_ratio = self._memory_ready_mask(self.slow_counts).float().mean().to(device=device, dtype=dtype)
+        else:
+            prototype_norm = 0.5 * (
+                self.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+                + self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+            )
+            memory_ready_ratio = 0.5 * (
+                self._memory_ready_mask(self.fast_counts).float().mean().to(device=device, dtype=dtype)
+                + self._memory_ready_mask(self.slow_counts).float().mean().to(device=device, dtype=dtype)
+            )
 
         nested_info = {
             "used_nested": torch.ones((), device=device, dtype=dtype),
             "delta_mean": delta.abs().mean(),
-            "prototype_norm": 0.5 * (self.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean() + self.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()),
+            "prototype_norm": prototype_norm,
             "memory_mix": context_mix.mean(),
             "memory_entropy": memory_entropy.mean(),
             "memory_quality": memory_quality.mean(),
-            "memory_ready_ratio": 0.5
-            * (
-                self._memory_ready_mask(self.fast_counts).float().mean().to(device=device, dtype=dtype)
-                + self._memory_ready_mask(self.slow_counts).float().mean().to(device=device, dtype=dtype)
-            ),
+            "memory_ready_ratio": memory_ready_ratio,
             "residual_gate": residual_gate.mean(),
             "fast_update_gate": fast_update_gate.mean(),
             "slow_update_gate": slow_update_gate.mean(),
@@ -454,6 +595,22 @@ class SafeNestedResidualRefiner(nn.Module):
         slow_assignments = nested_cache["slow_attn"].argmax(dim=-1)
         fast_gates = nested_cache["fast_update_gate"].to(device=self.fast_prototypes.device, dtype=self.fast_prototypes.dtype).flatten()
         slow_gates = nested_cache["slow_update_gate"].to(device=self.slow_prototypes.device, dtype=self.slow_prototypes.dtype).flatten()
+
+        if self.memory_mode != "slow_only":
+            self._bootstrap_memory_bank(
+                bank=self.fast_prototypes,
+                counts=self.fast_counts,
+                tokens=tokens,
+                update_gates=fast_gates,
+                max_norm=max_norm,
+            )
+        self._bootstrap_memory_bank(
+            bank=self.slow_prototypes,
+            counts=self.slow_counts,
+            tokens=tokens,
+            update_gates=slow_gates,
+            max_norm=max_norm,
+        )
 
         if self.memory_mode != "slow_only":
             self._update_memory_bank(

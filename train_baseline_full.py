@@ -25,7 +25,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2"], default="convnext_tiny")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")
@@ -91,14 +91,24 @@ def _default_model_kwargs(args) -> Dict[str, object]:
 
 def _infer_model_kwargs_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
     inferred = {}
+    lateral2_weight = state_dict.get("decoder.lateral2.weight")
+    lateral3_weight = state_dict.get("decoder.lateral3.weight")
+    lateral4_weight = state_dict.get("decoder.lateral4.weight")
     lateral5_weight = state_dict.get("decoder.lateral5.weight")
-    if isinstance(lateral5_weight, torch.Tensor) and lateral5_weight.ndim == 4:
-        encoder_channels = int(lateral5_weight.shape[1])
-        if encoder_channels == 512:
+    if all(isinstance(weight, torch.Tensor) and weight.ndim == 4 for weight in (lateral2_weight, lateral3_weight, lateral4_weight, lateral5_weight)):
+        encoder_channels = (
+            int(lateral2_weight.shape[1]),
+            int(lateral3_weight.shape[1]),
+            int(lateral4_weight.shape[1]),
+            int(lateral5_weight.shape[1]),
+        )
+        if encoder_channels == (64, 128, 256, 512):
             inferred["encoder_name"] = "tiny_convnext"
-        elif encoder_channels == 1024:
+        elif encoder_channels == (64, 128, 320, 512):
+            inferred["encoder_name"] = "pvtv2_b2"
+        elif encoder_channels == (128, 256, 512, 1024):
             inferred["encoder_name"] = "convnext_base"
-        elif encoder_channels == 768:
+        elif encoder_channels == (96, 192, 384, 768):
             stage3_block_indices = set()
             for key in state_dict.keys():
                 for prefix in ("encoder.features.5.", "features.5."):
