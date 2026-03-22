@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python rename_polygen_masks.py --root datasets/PolyGen --dry-run)"
+    ]
+  }
+}
