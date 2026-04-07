@@ -22,7 +22,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2"], default="convnext_tiny")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "convnext_large", "pvtv2_b2", "pvtv2_b5", "convnextv2_tiny", "convnextv2_base", "convnextv2_large", "swinv2_tiny", "swinv2_small", "swinv2_base"], default="convnext_tiny")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")
@@ -50,10 +50,10 @@ def build_parser():
     parser.add_argument("--encoder-lr", type=float, default=1e-4)
     parser.add_argument("--decoder-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60])
+    parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65])
     parser.add_argument("--use-ema", action="store_true")
     parser.add_argument("--use-tta", action="store_true")
-    parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0, 0.75, 1.25])
     parser.add_argument("--eval-nested-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--test-nested-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--patience", type=int, default=15)
@@ -135,6 +135,7 @@ def main():
         use_pretrained=args.use_pretrained,
         strict_pretrained=args.strict_pretrained,
         pretrained_cache_dir=pretrained_cache_dir,
+        img_size=args.image_size[0],
         decoder_channels=args.decoder_channels,
         dropout=args.dropout,
         enable_nested=args.enable_nested,

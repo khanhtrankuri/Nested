@@ -9,8 +9,8 @@ from typing import Dict, List, Sequence
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Run clean baseline ablations for nested memory and TTA")
-    parser.add_argument("--file-path", default="datasets/Kvasir/train")
-    parser.add_argument("--test-file-path", default="datasets/Kvasir/test")
+    parser.add_argument("--file-path", default="datasets/EndoScene/TrainDataset")
+    parser.add_argument("--test-file-path", default="datasets/EndoScene/TestDataset")
     parser.add_argument("--save-root", default="outputs/kvasir_clean_ablation")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--mode", choices=["plan", "run"], default="plan")
@@ -23,7 +23,7 @@ def build_parser():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2"], default="convnext_small")
+    parser.add_argument("--encoder-name", choices=["tiny_convnext", "convnext_tiny", "convnext_small", "convnext_base", "pvtv2_b2", "pvtv2_b4"], default="convnext_small")
     parser.add_argument("--use-pretrained", action="store_true")
     parser.add_argument("--decoder-channels", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)

@@ -37,17 +37,7 @@ python train_baseline_clean.py \
 
 ## Recommended more reliable run
 ```bash
-python train_baseline_clean.py \
-  --file-path datasets/Kvasir \
-  --save-root outputs/kvasir_clean_baseline_fold0 \
-  --image-size 384 384 \
-  --batch-size 8 \
-  --epochs 80 \
-  --protocol kfold \
-  --fold-index 0 \
-  --num-folds 5 \
-  --use-ema \
-  --use-tta
+ CUDA_VISIBLE_DEVICES=7 python train_baseline_clean.py --file-path datasets/Adenocarcinoma --save-root outputs/Adenocarcinoma --batch-size 16 --num-workers 8 --epochs 100 --encoder-name pvtv2_b5 --use-ema --use-tta --enable-nested --nested-start-epoch 20 --nested-memory-mode fast_slow --nested-dim 256 --pretrained-cache-dir ./pvt_v2_b5_weights
 ```
 
 ## Why this baseline is safer

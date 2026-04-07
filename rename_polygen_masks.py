@@ -115,15 +115,15 @@ def main():
     parser = argparse.ArgumentParser(description="Rename PolyGen masks to match image filenames")
     parser.add_argument(
         "--root",
-        default="datasets/PolyGen",
+        default="datasets/Kvasir_Sessile",
         help="Root folder containing Train/ and Test/ subdirs",
     )
-    parser.add_argument(
-        "--splits",
-        nargs="+",
-        default=["Train", "Test"],
-        help="Which splits to process (default: Train Test)",
-    )
+    # parser.add_argument(
+    #     "--splits",
+    #     nargs="+",
+    #     default=["Train", "Test"],
+    #     help="Which splits to process (default: Train Test)",
+    # )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -144,20 +144,28 @@ def main():
 
     total_renamed = total_skipped = total_errors = 0
 
-    for split in args.splits:
-        split_dir = os.path.join(args.root, split)
-        images_dir = os.path.join(split_dir, "images")
-        masks_dir = os.path.join(split_dir, "masks")
+    # for split in args.splits:
+    #     split_dir = os.path.join(args.root, split)
+    #     images_dir = os.path.join(split_dir, "images")
+    #     masks_dir = os.path.join(split_dir, "masks")
 
-        print(f"[{split}] images: {images_dir}")
-        print(f"[{split}] masks : {masks_dir}")
+    #     print(f"[{split}] images: {images_dir}")
+    #     print(f"[{split}] masks : {masks_dir}")
 
-        renamed, skipped, errors = _rename_masks(masks_dir, images_dir, dry_run=args.dry_run)
-        total_renamed += renamed
-        total_skipped += skipped
-        total_errors += errors
+    #     renamed, skipped, errors = _rename_masks(masks_dir, images_dir, dry_run=args.dry_run)
+    #     total_renamed += renamed
+    #     total_skipped += skipped
+    #     total_errors += errors
 
-        print(f"[{split}] renamed={renamed}  already_ok={skipped}  warnings={errors}\n")
+    images_dir = os.path.join(args.root, "images")
+    masks_dir = os.path.join(args.root, "masks")
+    print(f"[{args.root}] images: {images_dir}")
+    print(f"[{args.root}] masks : {masks_dir}")
+    renamed, skipped, errors = _rename_masks(masks_dir, images_dir, dry_run=args.dry_run)
+    total_renamed += renamed
+    total_skipped += skipped
+    total_errors += errors
+    print(f"[{args.root}] renamed={renamed}  already_ok={skipped}  warnings={errors}\n")
 
     print("=" * 50)
     print(f"TOTAL  renamed={total_renamed}  already_ok={total_skipped}  warnings={total_errors}")

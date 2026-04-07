@@ -102,9 +102,11 @@ class TorchvisionConvNeXtEncoder(nn.Module):
         try:
             from torchvision.models import (
                 ConvNeXt_Base_Weights,
+                ConvNeXt_Large_Weights,
                 ConvNeXt_Small_Weights,
                 ConvNeXt_Tiny_Weights,
                 convnext_base,
+                convnext_large,
                 convnext_small,
                 convnext_tiny,
             )
@@ -115,6 +117,7 @@ class TorchvisionConvNeXtEncoder(nn.Module):
             "convnext_tiny": (convnext_tiny, ConvNeXt_Tiny_Weights.DEFAULT, [96, 192, 384, 768]),
             "convnext_small": (convnext_small, ConvNeXt_Small_Weights.DEFAULT, [96, 192, 384, 768]),
             "convnext_base": (convnext_base, ConvNeXt_Base_Weights.DEFAULT, [128, 256, 512, 1024]),
+            "convnext_large": (convnext_large, ConvNeXt_Large_Weights.DEFAULT, [192, 384, 768, 1536]),
         }
         if variant not in builders:
             raise ValueError(f"Unsupported ConvNeXt variant: {variant}")
@@ -166,6 +169,7 @@ class TimmPyramidEncoder(nn.Module):
         use_pretrained: bool = False,
         strict_pretrained: bool = False,
         pretrained_cache_dir: Optional[str] = None,
+        img_size: Optional[int] = None,
     ):
         super().__init__()
         try:
@@ -179,6 +183,8 @@ class TimmPyramidEncoder(nn.Module):
             "out_indices": (0, 1, 2, 3),
             "in_chans": int(in_channels),
         }
+        if img_size is not None:
+            create_kwargs["img_size"] = img_size
         loaded_pretrained = False
         old_hf_home = None
         old_hf_cache = None
@@ -221,12 +227,123 @@ class TimmPyramidEncoder(nn.Module):
         self.out_channels = out_channels
         self.variant = variant
         self.pretrained_loaded = loaded_pretrained
+        self.checkpoint_compatible = True
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         outputs = self.model(x)
         if len(outputs) != 4:
             raise RuntimeError(f"{self.variant} returned {len(outputs)} feature maps instead of 4.")
+        # Some models (e.g. Swin) output channels-last [B, H, W, C]; convert to [B, C, H, W]
+        outputs = [o.permute(0, 3, 1, 2) if o.ndim == 4 and o.shape[1] != ch else o for o, ch in zip(outputs, self.out_channels)]
         return tuple(outputs)
+
+
+class PyramidDownsample(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class LocalPyramidBlock(nn.Module):
+    def __init__(self, dim: int, expansion: float = 4.0, drop_path: float = 0.0):
+        super().__init__()
+        hidden_dim = int(dim * expansion)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.norm = LayerNorm2d(dim)
+        self.pwconv1 = nn.Conv2d(dim, hidden_dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(hidden_dim, dim, kernel_size=1)
+        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
+        self.drop_path = drop_path
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = self.gamma[:, None, None] * x
+        if self.training and self.drop_path > 0.0:
+            keep = 1.0 - self.drop_path
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep + torch.rand(shape, dtype=x.dtype, device=x.device)
+            random_tensor.floor_()
+            x = x.div(keep) * random_tensor
+        return residual + x
+
+
+class OfflinePyramidEncoderB2(nn.Module):
+    """
+    Lightweight offline fallback for `pvt_v2_b2`.
+
+    This keeps the repo usable when `timm` cannot be installed, but it does not
+    try to be state-dict compatible with the real timm implementation.
+    """
+
+    def __init__(self, in_channels: int = 3):
+        super().__init__()
+        stage_depths = (3, 4, 6, 3)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+        self.stage1 = nn.Sequential(*[LocalPyramidBlock(64, drop_path=0.00 + idx * 0.005) for idx in range(stage_depths[0])])
+        self.down1 = PyramidDownsample(64, 128)
+        self.stage2 = nn.Sequential(*[LocalPyramidBlock(128, drop_path=0.02 + idx * 0.005) for idx in range(stage_depths[1])])
+        self.down2 = PyramidDownsample(128, 320)
+        self.stage3 = nn.Sequential(*[LocalPyramidBlock(320, drop_path=0.04 + idx * 0.004) for idx in range(stage_depths[2])])
+        self.down3 = PyramidDownsample(320, 512)
+        self.stage4 = nn.Sequential(*[LocalPyramidBlock(512, drop_path=0.065 + idx * 0.005) for idx in range(stage_depths[3])])
+        self.out_channels = [64, 128, 320, 512]
+        self.variant = "pvt_v2_b2"
+        self.pretrained_loaded = False
+        self.checkpoint_compatible = False
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        c2 = self.stage1(self.stem(x))
+        c3 = self.stage2(self.down1(c2))
+        c4 = self.stage3(self.down2(c3))
+        c5 = self.stage4(self.down3(c4))
+        return c2, c3, c4, c5
+
+
+def build_pvtv2_b2_encoder(
+    in_channels: int = 3,
+    use_pretrained: bool = False,
+    strict_pretrained: bool = False,
+    pretrained_cache_dir: Optional[str] = None,
+):
+    try:
+        return TimmPyramidEncoder(
+            variant="pvt_v2_b2",
+            in_channels=in_channels,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+        )
+    except ImportError as exc:
+        if use_pretrained or strict_pretrained:
+            raise ImportError(
+                "pvt_v2_b2 requires `timm`, and pretrained weights are unavailable in the offline fallback. "
+                "Install `timm` or switch to `tiny_convnext`, `convnext_tiny`, `convnext_small`, or `convnext_base`."
+            ) from exc
+        print(
+            "[StrongBaseline] timm is not installed; using the built-in offline fallback for pvt_v2_b2. "
+            "This fallback is randomly initialized and cannot load timm PVT checkpoints."
+        )
+        return OfflinePyramidEncoderB2(in_channels=in_channels)
 
 
 def build_encoder(
@@ -235,13 +352,14 @@ def build_encoder(
     use_pretrained: bool = False,
     strict_pretrained: bool = False,
     pretrained_cache_dir: Optional[str] = None,
+    img_size: Optional[int] = None,
 ):
     encoder_name = encoder_name.lower()
     if encoder_name == "tiny_convnext":
         encoder = TinyConvNeXtEncoder(in_channels=in_channels)
         encoder.pretrained_loaded = False
         return encoder
-    if encoder_name in {"convnext_tiny", "convnext_small", "convnext_base"}:
+    if encoder_name in {"convnext_tiny", "convnext_small", "convnext_base", "convnext_large"}:
         return TorchvisionConvNeXtEncoder(
             variant=encoder_name,
             in_channels=in_channels,
@@ -250,12 +368,46 @@ def build_encoder(
             pretrained_cache_dir=pretrained_cache_dir,
         )
     if encoder_name == "pvtv2_b2":
-        return TimmPyramidEncoder(
-            variant="pvt_v2_b2",
+        return build_pvtv2_b2_encoder(
             in_channels=in_channels,
             use_pretrained=use_pretrained,
             strict_pretrained=strict_pretrained,
             pretrained_cache_dir=pretrained_cache_dir,
+        )
+    if encoder_name == "pvtv2_b5":
+        return TimmPyramidEncoder(
+            variant="pvt_v2_b5",
+            in_channels=in_channels,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+        )
+    convnextv2_variants = {
+        "convnextv2_tiny": "convnextv2_tiny",
+        "convnextv2_base": "convnextv2_base",
+        "convnextv2_large": "convnextv2_large",
+    }
+    if encoder_name in convnextv2_variants:
+        return TimmPyramidEncoder(
+            variant=convnextv2_variants[encoder_name],
+            in_channels=in_channels,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+        )
+    swinv2_variants = {
+        "swinv2_tiny": "swinv2_tiny_window8_256",
+        "swinv2_small": "swinv2_small_window8_256",
+        "swinv2_base": "swinv2_base_window8_256",
+    }
+    if encoder_name in swinv2_variants:
+        return TimmPyramidEncoder(
+            variant=swinv2_variants[encoder_name],
+            in_channels=in_channels,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+            img_size=img_size,
         )
     raise ValueError(f"Unsupported encoder_name: {encoder_name}")
 
@@ -677,6 +829,7 @@ class StrongBaselinePolypModel(nn.Module):
         use_pretrained: bool = False,
         strict_pretrained: bool = False,
         pretrained_cache_dir: Optional[str] = None,
+        img_size: Optional[int] = None,
         enable_nested: bool = False,
         nested_dim: int = 128,
         nested_prototypes: int = 8,
@@ -698,6 +851,7 @@ class StrongBaselinePolypModel(nn.Module):
             use_pretrained=use_pretrained,
             strict_pretrained=strict_pretrained,
             pretrained_cache_dir=pretrained_cache_dir,
+            img_size=img_size,
         )
         self.pretrained_loaded = bool(getattr(self.encoder, "pretrained_loaded", False))
         self.decoder = FPNDecoder(self.encoder.out_channels, pyramid_channels=256, seg_channels=decoder_channels)
@@ -728,6 +882,20 @@ class StrongBaselinePolypModel(nn.Module):
             "encoder": encoder_params,
             "decoder": decoder_params,
         }
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if not getattr(self.encoder, "checkpoint_compatible", True):
+            has_encoder_weights = isinstance(state_dict, dict) and any(str(key).startswith("encoder.") for key in state_dict.keys())
+            if has_encoder_weights:
+                raise RuntimeError(
+                    "This run is using the built-in offline `pvtv2_b2` fallback because `timm` is unavailable. "
+                    "The checkpoint contains encoder weights and is not compatible with the fallback encoder. "
+                    "Install `timm`, or use a ConvNeXt/tiny_convnext checkpoint instead."
+                )
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
 
     def forward(self, x: torch.Tensor, use_nested: bool = False) -> Dict[str, torch.Tensor]:
         input_size = x.shape[-2:]
