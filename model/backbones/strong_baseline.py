@@ -425,14 +425,63 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.fc(x).unsqueeze(-1).unsqueeze(-1)
+
+
+class BiFPNFuseCell(nn.Module):
+    """BiFPN-style learnable weighted fusion of two feature maps."""
+
+    def __init__(self, channels: int, eps: float = 1e-4):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(2))
+        self.eps = eps
+        self.conv = ConvBNAct(channels, channels)
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+        w = F.relu(self.w)
+        w = w / (w.sum() + self.eps)
+        return self.conv(w[0] * feat_a + w[1] * feat_b)
+
+
 class FPNDecoder(nn.Module):
     def __init__(self, encoder_channels, pyramid_channels: int = 256, seg_channels: int = 128):
         super().__init__()
         c2, c3, c4, c5 = encoder_channels
+        # Lateral projections
         self.lateral5 = nn.Conv2d(c5, pyramid_channels, kernel_size=1)
         self.lateral4 = nn.Conv2d(c4, pyramid_channels, kernel_size=1)
         self.lateral3 = nn.Conv2d(c3, pyramid_channels, kernel_size=1)
         self.lateral2 = nn.Conv2d(c2, pyramid_channels, kernel_size=1)
+        # SE attention after each lateral
+        self.se5 = SEBlock(pyramid_channels)
+        self.se4 = SEBlock(pyramid_channels)
+        self.se3 = SEBlock(pyramid_channels)
+        self.se2 = SEBlock(pyramid_channels)
+        # BiFPN weighted fusion (top-down)
+        self.bifpn_td4 = BiFPNFuseCell(pyramid_channels)
+        self.bifpn_td3 = BiFPNFuseCell(pyramid_channels)
+        self.bifpn_td2 = BiFPNFuseCell(pyramid_channels)
+        # BiFPN weighted fusion (bottom-up)
+        self.bifpn_bu3 = BiFPNFuseCell(pyramid_channels)
+        self.bifpn_bu4 = BiFPNFuseCell(pyramid_channels)
+        self.bifpn_bu5 = BiFPNFuseCell(pyramid_channels)
+        # Smoothing
         self.smooth5 = ConvBNAct(pyramid_channels, seg_channels)
         self.smooth4 = ConvBNAct(pyramid_channels, seg_channels)
         self.smooth3 = ConvBNAct(pyramid_channels, seg_channels)
@@ -440,14 +489,24 @@ class FPNDecoder(nn.Module):
         self.fuse = nn.Sequential(ConvBNAct(seg_channels * 4, seg_channels), ConvBNAct(seg_channels, seg_channels))
 
     def forward(self, c2, c3, c4, c5):
-        p5 = self.lateral5(c5)
-        p4 = self.lateral4(c4) + F.interpolate(p5, size=c4.shape[-2:], mode="bilinear", align_corners=False)
-        p3 = self.lateral3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="bilinear", align_corners=False)
-        p2 = self.lateral2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode="bilinear", align_corners=False)
-        s5 = self.smooth5(p5)
-        s4 = self.smooth4(p4)
-        s3 = self.smooth3(p3)
-        s2 = self.smooth2(p2)
+        # Lateral + SE channel attention
+        p5 = self.se5(self.lateral5(c5))
+        p4 = self.se4(self.lateral4(c4))
+        p3 = self.se3(self.lateral3(c3))
+        p2 = self.se2(self.lateral2(c2))
+        # Top-down pathway with BiFPN weighted fusion
+        p4_td = self.bifpn_td4(p4, F.interpolate(p5, size=p4.shape[-2:], mode="bilinear", align_corners=False))
+        p3_td = self.bifpn_td3(p3, F.interpolate(p4_td, size=p3.shape[-2:], mode="bilinear", align_corners=False))
+        p2_td = self.bifpn_td2(p2, F.interpolate(p3_td, size=p2.shape[-2:], mode="bilinear", align_corners=False))
+        # Bottom-up pathway with BiFPN weighted fusion
+        p3_out = self.bifpn_bu3(p3_td, F.interpolate(p2_td, size=p3_td.shape[-2:], mode="bilinear", align_corners=False))
+        p4_out = self.bifpn_bu4(p4_td, F.interpolate(p3_out, size=p4_td.shape[-2:], mode="bilinear", align_corners=False))
+        p5_out = self.bifpn_bu5(p5, F.interpolate(p4_out, size=p5.shape[-2:], mode="bilinear", align_corners=False))
+        # Smooth and fuse
+        s5 = self.smooth5(p5_out)
+        s4 = self.smooth4(p4_out)
+        s3 = self.smooth3(p3_out)
+        s2 = self.smooth2(p2_td)
         target_size = s2.shape[-2:]
         s3 = F.interpolate(s3, size=target_size, mode="bilinear", align_corners=False)
         s4 = F.interpolate(s4, size=target_size, mode="bilinear", align_corners=False)
@@ -487,9 +546,20 @@ class SafeNestedResidualRefiner(nn.Module):
         self.max_foreground_ratio = float(max_foreground_ratio)
 
         self.query_proj = nn.Conv2d(feat_channels, nested_dim, kernel_size=1, bias=False)
+        residual_in = feat_channels + nested_dim + 1
+        residual_mid = feat_channels
         self.residual_head = nn.Sequential(
-            ConvBNAct(feat_channels + nested_dim + 1, feat_channels),
-            nn.Conv2d(feat_channels, 1, kernel_size=1),
+            ConvBNAct(residual_in, residual_mid),
+            ConvBNAct(residual_mid, residual_mid),
+            nn.Conv2d(residual_mid, 1, kernel_size=1),
+        )
+        # Learnable uncertainty gate: replaces hard-coded threshold with a learned spatial gate
+        self.uncertainty_gate_net = nn.Sequential(
+            nn.Conv2d(feat_channels + 1, feat_channels // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feat_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feat_channels // 2, 1, kernel_size=1),
+            nn.Sigmoid(),
         )
         gate_in_dim = nested_dim + 4
         hidden_dim = max(int(memory_hidden_dim), 32)
@@ -619,6 +689,40 @@ class SafeNestedResidualRefiner(nn.Module):
         entropy = self._attention_entropy(ready_attn).to(dtype=dtype)
         return context, full_attn, entropy
 
+    def _attend_memory_spatial(
+        self,
+        query_feat: torch.Tensor,
+        bank: torch.Tensor,
+        counts: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Spatial-aware memory attention: each spatial position queries the memory bank independently."""
+        B, C, H, W = query_feat.shape
+        ready_mask = self._memory_ready_mask(counts).to(device=device)
+
+        if not bool(torch.any(ready_mask).item()):
+            zero_context = torch.zeros(B, C, H, W, device=device, dtype=dtype)
+            zero_attn = torch.zeros(B, bank.size(0), device=device, dtype=dtype)
+            zero_entropy = torch.zeros(B, device=device, dtype=dtype)
+            return zero_context, zero_attn, zero_entropy
+
+        normalized_bank = F.normalize(bank[ready_mask].to(device=device, dtype=dtype), dim=-1)  # (K, C)
+        query_flat = F.normalize(query_feat.flatten(2).permute(0, 2, 1), dim=-1)  # (B, H*W, C)
+
+        attn_logits = torch.matmul(query_flat, normalized_bank.t()) / math.sqrt(self.nested_dim)  # (B, H*W, K)
+        spatial_attn = torch.softmax(attn_logits, dim=-1)
+        spatial_context = torch.matmul(spatial_attn.to(dtype=normalized_bank.dtype), normalized_bank)  # (B, H*W, C)
+        spatial_context = spatial_context.permute(0, 2, 1).reshape(B, C, H, W)
+
+        # Summary attention for logging and cache (average over spatial positions)
+        mean_attn = spatial_attn.mean(dim=1)  # (B, K)
+        full_attn = torch.zeros(B, bank.size(0), device=device, dtype=dtype)
+        full_attn[:, ready_mask] = mean_attn.to(dtype=full_attn.dtype)
+        entropy = self._attention_entropy(mean_attn).to(dtype=dtype)
+
+        return spatial_context, full_attn, entropy
+
     def _build_memory_controls(
         self,
         token: torch.Tensor,
@@ -663,15 +767,15 @@ class SafeNestedResidualRefiner(nn.Module):
         fast_update_gate = fast_update_gate * memory_quality
         slow_update_gate = slow_update_gate * memory_quality
 
-        context_fast, fast_attn, fast_entropy = self._attend_memory(
-            token,
+        context_fast, fast_attn, fast_entropy = self._attend_memory_spatial(
+            query_feat,
             bank=self.fast_prototypes,
             counts=self.fast_counts,
             device=device,
             dtype=dtype,
         )
-        context_slow, slow_attn, slow_entropy = self._attend_memory(
-            token,
+        context_slow, slow_attn, slow_entropy = self._attend_memory_spatial(
+            query_feat,
             bank=self.slow_prototypes,
             counts=self.slow_counts,
             device=device,
@@ -682,16 +786,10 @@ class SafeNestedResidualRefiner(nn.Module):
             fast_update_gate = torch.zeros_like(fast_update_gate)
             context = context_slow
         else:
-            context = context_mix * context_fast + (1.0 - context_mix) * context_slow
-        context = context.unsqueeze(-1).unsqueeze(-1)
-
-        context = context.expand(-1, -1, feat.shape[-2], feat.shape[-1])
+            mix_map = context_mix.view(-1, 1, 1, 1)
+            context = mix_map * context_fast + (1.0 - mix_map) * context_slow
         uncertainty = self._uncertainty(coarse_lowres_logits)
-        uncertainty_gate = torch.clamp(
-            (uncertainty - self.uncertainty_floor) / max(1.0 - self.uncertainty_floor, 1e-6),
-            min=0.0,
-            max=1.0,
-        )
+        uncertainty_gate = self.uncertainty_gate_net(torch.cat([feat, uncertainty], dim=1))
         delta = self.residual_head(torch.cat([feat, context, uncertainty], dim=1))
         residual_gate_map = residual_gate.view(-1, 1, 1, 1)
         refined = coarse_lowres_logits + self.residual_scale * residual_gate_map * uncertainty_gate * delta
@@ -845,6 +943,7 @@ class StrongBaselinePolypModel(nn.Module):
         self.strict_pretrained = bool(strict_pretrained)
         self.enable_nested = bool(enable_nested)
         self.nested_memory_mode = nested_memory_mode
+        self.img_size = img_size
         self.encoder = build_encoder(
             encoder_name=encoder_name,
             in_channels=in_channels,

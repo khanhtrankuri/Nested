@@ -7,15 +7,17 @@ import torch
 from torch.amp import GradScaler
 
 from data.load_data_clean import build_clean_dataloaders
-from engine.train_eval_clean import ModelEMA, test_clean, threshold_sweep_clean, train_one_epoch_clean
+from data.load_GlaS_dataset import build_glas_dataloaders
+from engine.train_eval_clean import ModelEMA, evaluate_clean, test_clean, threshold_sweep_clean, train_one_epoch_clean
 from loss.strong_baseline_loss import StrongBaselineLoss
 from model.backbones.strong_baseline import StrongBaselinePolypModel
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Clean strong baseline for Kvasir polyp segmentation")
-    parser.add_argument("--file-path", default="datasets/Kvasir/train")
-    parser.add_argument("--save-root", default="outputs/kvasir_clean_baseline")
+    parser = argparse.ArgumentParser(description="Clean strong baseline for segmentation")
+    parser.add_argument("--dataset", choices=["kvasir", "glas"], default="kvasir")
+    parser.add_argument("--file-path", default="")
+    parser.add_argument("--save-root", default="")
     parser.add_argument("--image-size", type=int, nargs=2, default=(384, 384), metavar=("H", "W"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -27,17 +29,17 @@ def build_parser():
     parser.add_argument("--strict-pretrained", action="store_true")
     parser.add_argument("--pretrained-cache-dir", default="")
     parser.add_argument("--decoder-channels", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--init-checkpoint", default="")
     parser.add_argument("--enable-nested", action="store_true")
     parser.add_argument("--nested-start-epoch", type=int, default=20)
     parser.add_argument("--nested-dim", type=int, default=128)
     parser.add_argument("--nested-prototypes", type=int, default=8)
-    parser.add_argument("--nested-residual-scale", type=float, default=0.05)
+    parser.add_argument("--nested-residual-scale", type=float, default=0.15)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
     parser.add_argument("--nested-memory-mode", choices=["fast_slow", "slow_only"], default="fast_slow")
     parser.add_argument("--nested-memory-hidden", type=int, default=128)
-    parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.25)
+    parser.add_argument("--nested-slow-momentum-scale", type=float, default=0.3)
     parser.add_argument("--nested-momentum", type=float, default=0.03)
     parser.add_argument("--skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_true")
     parser.add_argument("--no-skip-nested-if-hurts", dest="skip_nested_if_hurts", action="store_false")
@@ -52,15 +54,18 @@ def build_parser():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--thresholds", type=float, nargs="+", default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65])
     parser.add_argument("--use-ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--use-tta", action="store_true")
     parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0, 0.75, 1.25])
     parser.add_argument("--eval-nested-mode", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--test-nested-mode", choices=["auto", "on", "off"], default="auto")
-    parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--small-polyp-sampling-power", type=float, default=0.35)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--small-polyp-sampling-power", type=float, default=0.25)
     parser.add_argument("--stratified-split", dest="stratified_split", action="store_true")
     parser.add_argument("--no-stratified-split", dest="stratified_split", action="store_false")
     parser.set_defaults(stratified_split=True)
+    parser.add_argument("--glas-val-ratio", type=float, default=0.0,
+                        help="GlaS: fraction of train to hold out as val (0 = use testA as val)")
     return parser
 
 
@@ -108,6 +113,19 @@ def _split_param_groups(model):
 
 def main():
     args = build_parser().parse_args()
+
+    # --- Dataset-specific defaults ---
+    if args.dataset == "glas":
+        if not args.file_path:
+            args.file_path = "datasets/Warwick_QU_Dataset"
+        if not args.save_root:
+            args.save_root = "outputs/glas_clean_baseline"
+    else:
+        if not args.file_path:
+            args.file_path = "datasets/Kvasir/train"
+        if not args.save_root:
+            args.save_root = "outputs/kvasir_clean_baseline"
+
     os.makedirs(args.save_root, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -115,19 +133,35 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
-        file_path=args.file_path,
-        image_size=tuple(args.image_size),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        protocol=args.protocol,
-        fold_index=args.fold_index,
-        num_folds=args.num_folds,
-        train_augmentation=True,
-        stratified_split=args.stratified_split,
-        small_polyp_sampling_power=args.small_polyp_sampling_power,
-    )
+    # --- Build dataloaders ---
+    test_loaders = {}
+    if args.dataset == "glas":
+        train_loader, val_loader, testA_loader, testB_loader, meta_info = build_glas_dataloaders(
+            root_dir=args.file_path,
+            image_size=tuple(args.image_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            train_augmentation=True,
+            val_ratio=args.glas_val_ratio,
+        )
+        test_loaders["testA"] = testA_loader
+        test_loaders["testB"] = testB_loader
+    else:
+        train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
+            file_path=args.file_path,
+            image_size=tuple(args.image_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            protocol=args.protocol,
+            fold_index=args.fold_index,
+            num_folds=args.num_folds,
+            train_augmentation=True,
+            stratified_split=args.stratified_split,
+            small_polyp_sampling_power=args.small_polyp_sampling_power,
+        )
+        test_loaders["test"] = test_loader
 
     pretrained_cache_dir = args.pretrained_cache_dir.strip() or os.path.join(args.save_root, ".torch_cache")
     model = StrongBaselinePolypModel(
@@ -211,7 +245,7 @@ def main():
     )
 
     scaler = GradScaler("cuda", enabled=torch.cuda.is_available())
-    ema = ModelEMA(model, decay=0.999) if args.use_ema else None
+    ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
 
     best_state = None
     best_val = {"iou": -1.0, "dice": -1.0, "threshold": 0.5}
@@ -255,21 +289,46 @@ def main():
             use_nested=val_nested_active,
         )
 
+        # Evaluate testA and testB each epoch (GlaS only)
+        test_metrics_epoch = {}
+        if args.dataset == "glas":
+            best_thr = val_best["threshold"]
+            for split_name, loader in test_loaders.items():
+                split_metrics = evaluate_clean(
+                    model=eval_model,
+                    loader=loader,
+                    criterion=criterion,
+                    device=device,
+                    threshold=best_thr,
+                    use_amp=True,
+                    use_tta=args.use_tta,
+                    tta_scales=args.tta_scales,
+                    use_nested=val_nested_active,
+                )
+                test_metrics_epoch[split_name] = split_metrics
+
         current_lr = optimizer.param_groups[0]["lr"]
-        history.append({
+        history_entry = {
             "epoch": epoch,
             "lr": current_lr,
             "nested_active": nested_active,
             "val_nested_active": val_nested_active,
             "train": train_metrics,
             "val": val_best,
-        })
+        }
+        if test_metrics_epoch:
+            history_entry["test"] = test_metrics_epoch
+        history.append(history_entry)
 
+        test_log = ""
+        for split_name, m in test_metrics_epoch.items():
+            test_log += f" | {split_name}_iou={m['iou']:.4f} | {split_name}_dice={m['dice']:.4f}"
         print(
             f"\n[Epoch {epoch}] lr={current_lr:.7f} | "
             f"train_iou={train_metrics['iou']:.4f} | "
             f"val_iou={val_best['iou']:.4f} | val_dice={val_best['dice']:.4f} | "
-            f"best_thr={val_best['threshold']:.2f} | nested_active={nested_active} | val_nested={val_nested_active}\n"
+            f"best_thr={val_best['threshold']:.2f} | nested_active={nested_active} | val_nested={val_nested_active}"
+            f"{test_log}\n"
         )
 
         improved = False
@@ -308,29 +367,32 @@ def main():
 
     model.load_state_dict(best_state)
     test_nested_active = _resolve_nested_usage(args.test_nested_mode, best_nested_active)
-    test_metrics = test_clean(
-        model=model,
-        loader=test_loader,
-        criterion=criterion,
-        device=device,
-        save_dir=os.path.join(args.save_root, "predictions"),
-        threshold=best_val["threshold"],
-        use_amp=True,
-        use_tta=args.use_tta,
-        tta_scales=args.tta_scales,
-        use_nested=test_nested_active,
-    )
+
+    all_test_metrics = {}
+    for split_name, loader in test_loaders.items():
+        metrics = test_clean(
+            model=model,
+            loader=loader,
+            criterion=criterion,
+            device=device,
+            save_dir=os.path.join(args.save_root, f"predictions_{split_name}"),
+            threshold=best_val["threshold"],
+            use_amp=True,
+            use_tta=args.use_tta,
+            tta_scales=args.tta_scales,
+            use_nested=test_nested_active,
+        )
+        all_test_metrics[split_name] = metrics
+        print(f"[{split_name}] IoU: {metrics['iou']:.4f} | Dice: {metrics['dice']:.4f}")
 
     with open(os.path.join(args.save_root, "test_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(test_metrics, f, indent=2)
+        json.dump(all_test_metrics, f, indent=2)
 
-    print(f"Best validation IoU: {best_val['iou']:.4f}")
+    print(f"\nBest validation IoU: {best_val['iou']:.4f}")
     print(f"Best validation Dice: {best_val['dice']:.4f}")
     print(f"Best threshold: {best_val['threshold']:.2f}")
     print(f"Best nested active: {best_nested_active}")
     print(f"Final test nested active: {test_nested_active}")
-    print(f"Test IoU: {test_metrics['iou']:.4f}")
-    print(f"Test Dice: {test_metrics['dice']:.4f}")
 
 
 if __name__ == "__main__":

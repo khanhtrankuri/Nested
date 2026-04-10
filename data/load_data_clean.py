@@ -233,6 +233,20 @@ class CleanPolypDataset(Dataset):
         mask = mask.rotate(angle, resample=Image.NEAREST, fillcolor=0)
         return image, mask
 
+    def _apply_random_crop(self, image, mask):
+        if random.random() > 0.5:
+            return image, mask
+        w, h = image.size
+        scale = random.uniform(0.65, 1.0)
+        ratio = random.uniform(0.8, 1.25)
+        crop_w = int(min(w, max(w * 0.3, w * scale * ratio ** 0.5)))
+        crop_h = int(min(h, max(h * 0.3, h * scale / ratio ** 0.5)))
+        x0 = random.randint(0, max(0, w - crop_w))
+        y0 = random.randint(0, max(0, h - crop_h))
+        image = image.crop((x0, y0, x0 + crop_w, y0 + crop_h))
+        mask = mask.crop((x0, y0, x0 + crop_w, y0 + crop_h))
+        return image, mask
+
     def _apply_color_aug(self, image: Image.Image):
         if random.random() < 0.8:
             image = ImageOps.autocontrast(image)
@@ -286,6 +300,7 @@ class CleanPolypDataset(Dataset):
             mask = mask.convert("L")
             if self.augment:
                 image, mask = self._apply_flip(image, mask)
+                image, mask = self._apply_random_crop(image, mask)
                 image, mask = self._apply_affine(image, mask)
                 image = self._apply_color_aug(image)
             image, mask = self._resize_pair(image, mask)

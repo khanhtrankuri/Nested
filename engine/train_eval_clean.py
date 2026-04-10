@@ -75,7 +75,15 @@ def _forward_with_tta(
 
         for flip_dims in (None, [3], [2], [2, 3]):
             flipped_images = scaled_images if flip_dims is None else torch.flip(scaled_images, dims=flip_dims)
-            logits = _forward_logits(model, flipped_images, use_nested=use_nested)
+            # If the model requires a fixed input size, resize to that size before
+            # forwarding and resize logits back to the base resolution afterward.
+            model_input = flipped_images
+            input_h, input_w = model_input.shape[-2:]
+            if hasattr(model, "img_size") and model.img_size is not None:
+                mh, mw = (model.img_size, model.img_size) if isinstance(model.img_size, int) else model.img_size
+                if (input_h, input_w) != (mh, mw):
+                    model_input = F.interpolate(model_input, size=(mh, mw), mode="bilinear", align_corners=False)
+            logits = _forward_logits(model, model_input, use_nested=use_nested)
             if flip_dims is not None:
                 logits = torch.flip(logits, dims=flip_dims)
             if logits.shape[-2:] != (base_h, base_w):
