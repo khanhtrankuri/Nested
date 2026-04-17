@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python rename_polygen_masks.py --root datasets/PolyGen --dry-run)"
+      "Bash(python rename_polygen_masks.py --root datasets/PolyGen --dry-run)",
+      "Bash(python -c \"import torch; print\\('torch:', torch.__version__\\); print\\('cuda:', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(where python:*)",
+      "Bash(conda env:*)",
+      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" -c \"import torch; print\\('torch:', torch.__version__\\); print\\('cuda:', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name tiny_convnext --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --no-amp --file-path datasets/TrainDataset)",
+      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name tiny_convnext --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --file-path datasets/TrainDataset)",
+      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name pvtv2_b2 --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --enable-nested --nested-start-epoch 1 --file-path datasets/TrainDataset)"
     ]
   }
 }

@@ -142,7 +142,15 @@ def train_one_epoch_clean(
         with autocast(device_type="cuda", enabled=amp_enabled):
             outputs = model(images, use_nested=use_nested)
             nested_available = bool(outputs.get("nested_cache") is not None)
-            if nested_available:
+            # In v2 (CMSDecoder), coarse_logits IS logits (same tensor) —
+            # skip_nested_if_hurts comparison is meaningless since base == nested.
+            # Only use skip logic when coarse_logits is genuinely different.
+            coarse_is_separate = (
+                nested_available
+                and "coarse_logits" in outputs
+                and outputs["coarse_logits"] is not outputs["logits"]
+            )
+            if coarse_is_separate:
                 base_outputs = _select_primary_outputs(outputs, use_coarse=True)
                 base_loss, base_loss_dict = criterion(base_outputs, masks, return_components=True)
                 nested_loss, nested_loss_dict = criterion(outputs, masks, return_components=True)
@@ -160,7 +168,7 @@ def train_one_epoch_clean(
             else:
                 chosen_outputs = outputs
                 loss, loss_dict = criterion(outputs, masks, return_components=True)
-                nested_used = False
+                nested_used = bool(nested_available)
 
         if scaler is not None and amp_enabled:
             scaler.scale(loss).backward()
@@ -175,7 +183,9 @@ def train_one_epoch_clean(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
-        if use_nested and nested_used:
+        # Always update prototypes when cache is available (pre-warm).
+        # This prevents sudden distribution shift when nested activates.
+        if outputs.get("nested_cache") is not None:
             model.update_nested_prototypes(outputs["nested_cache"], momentum=nested_momentum, max_norm=nested_max_norm)
         if ema is not None:
             ema.update(model)

@@ -1,0 +1,901 @@
+"""
+Train Nested-Learning PolyMemnet v2 (Strategy B + CMS Decoder).
+
+Kien truc moi:
+  Input -> SelfModifyingEncoder(backbone + NL blocks) -> c2..c5
+        -> CMSDecoder (BiFPN + CMS memory + prototype + uncertainty)
+           -> fused_feat (adapted) + aux_feat (raw c5)
+        -> seg_head -> logits (output CUOI, khong con coarse/refined)
+        -> aux_head -> aux_logits
+
+Inner loop (Level 2a) tu cap nhat modifier weights qua surprise objective.
+CMS memory (Level 2b) cap nhat per spatial position qua linear attention.
+Prototype banks (Level 2c) cap nhat qua EMA across training samples.
+
+Usage:
+  python train.py --dataset kvasir --file-path datasets/TrainDataset \
+      --encoder-name pvtv2_b2 --batch-size 8 --epochs 60 --use-pretrained
+"""
+
+import argparse
+import copy
+import json
+import os
+from typing import Dict, List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.amp import GradScaler
+
+from data.load_data_clean import build_clean_dataloaders
+from data.load_GlaS_dataset import build_glas_dataloaders
+from engine.train_eval_clean import (
+    ModelEMA,
+    evaluate_clean,
+    test_clean,
+    threshold_sweep_clean,
+    train_one_epoch_clean,
+)
+from loss.strong_baseline_loss import StrongBaselineLoss
+from model.backbones.self_modifying_encoder import SelfModifyingEncoder
+from model.backbones.strong_baseline import ConvBNAct, build_encoder
+from model.backbones.cms_decoder import CMSDecoder
+
+
+# =============================================================================
+# Model — SelfModifyingEncoder + CMSDecoder (replaces FPN + Refiner)
+# =============================================================================
+
+
+class NestedPolypModel(nn.Module):
+    """PolyMemnet v2: Self-Modifying Encoder (Strategy B) + CMS Decoder (Option B).
+
+    Thay doi so voi v1:
+    - CMSDecoder thay the FPNDecoder + SafeNestedResidualRefiner
+    - Khong con coarse_logits / refined_logits, chi co logits duy nhat
+    - aux_feat = raw c5 (512-ch) thay vi smoothed p5 (128-ch)
+    - Prototype EMA update thong qua CMSDecoder.update_prototypes()
+    """
+
+    def __init__(
+        self,
+        encoder_name: str,
+        use_pretrained: bool = False,
+        strict_pretrained: bool = False,
+        pretrained_cache_dir: Optional[str] = None,
+        img_size: Optional[int] = None,
+        decoder_channels: int = 128,
+        dropout: float = 0.1,
+        # NL encoder params
+        nl_inner_steps: Optional[List[int]] = None,
+        nl_inner_lr: float = 0.01,
+        nl_apply_stages: Optional[List[int]] = None,
+        nl_freeze_backbone: bool = False,
+        nl_modifier_expansion: int = 2,
+        nl_dropout: float = 0.1,
+        # CMS Decoder params
+        enable_nested: bool = False,
+        cms_levels: Optional[List[int]] = None,
+        memory_dim: int = 64,
+        num_heads: int = 4,
+        gate_init_bias: float = -2.0,
+        num_prototypes: int = 8,
+        prototype_dim: int = 128,
+        fast_momentum: float = 0.03,
+        slow_momentum: float = 0.0075,
+    ):
+        super().__init__()
+        self.encoder_name = encoder_name
+        self.img_size = img_size
+        self.enable_nested = bool(enable_nested)
+
+        backbone = build_encoder(
+            encoder_name=encoder_name,
+            in_channels=3,
+            use_pretrained=use_pretrained,
+            strict_pretrained=strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+            img_size=img_size,
+        )
+        self.pretrained_loaded = bool(getattr(backbone, "pretrained_loaded", False))
+        self.backbone_channels = list(backbone.out_channels)
+
+        if nl_inner_steps is None:
+            nl_inner_steps = [1, 2, 3, 4]
+        if len(nl_inner_steps) != 4:
+            raise ValueError(f"nl_inner_steps must have 4 values, got {nl_inner_steps}")
+        if nl_apply_stages is None:
+            nl_apply_stages = [2, 3]
+        if cms_levels is None:
+            cms_levels = [0, 1, 2, 3]
+
+        self.nl_apply_stages = list(nl_apply_stages)
+
+        self.encoder = SelfModifyingEncoder(
+            backbone=backbone,
+            feature_channels=self.backbone_channels,
+            inner_steps_schedule=nl_inner_steps,
+            inner_lr=nl_inner_lr,
+            apply_stages=self.nl_apply_stages,
+            freeze_backbone=nl_freeze_backbone,
+            modifier_expansion=nl_modifier_expansion,
+            dropout=nl_dropout,
+        )
+
+        self.decoder = CMSDecoder(
+            encoder_channels=self.backbone_channels,
+            fpn_channels=decoder_channels,
+            num_prototypes=num_prototypes,
+            prototype_dim=prototype_dim,
+            fast_momentum=fast_momentum,
+            slow_momentum=slow_momentum,
+            num_heads=num_heads,
+            cms_levels=cms_levels,
+            memory_dim=memory_dim,
+            gate_init_bias=gate_init_bias,
+        )
+
+        self.dropout = nn.Dropout2d(dropout)
+        self.seg_head = nn.Sequential(
+            ConvBNAct(decoder_channels, decoder_channels),
+            nn.Conv2d(decoder_channels, 1, 1),
+        )
+        # aux_feat = raw c5 from encoder (encoder_channels[-1] dim)
+        c5_channels = self.backbone_channels[-1]
+        self.aux_head = nn.Sequential(
+            ConvBNAct(c5_channels, decoder_channels // 2),
+            nn.Conv2d(decoder_channels // 2, 1, 1),
+        )
+
+    def get_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
+        encoder_params = list(self.encoder.parameters())
+        encoder_param_ids = {id(p) for p in encoder_params}
+        decoder_params = [p for p in self.parameters() if id(p) not in encoder_param_ids]
+        return {"encoder": encoder_params, "decoder": decoder_params}
+
+    def _build_nested_info(
+        self, decoder_info: Dict, device: torch.device, dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        """Build engine-compatible nested_info dict from decoder_info.
+
+        The training engine (train_eval_clean.py) reads specific keys from
+        nested_info for logging meters. We map CMS decoder outputs to those keys.
+        """
+        zero = torch.zeros((), device=device, dtype=dtype)
+
+        # Average CMS gate values -> residual_gate meter
+        cms_gates = decoder_info.get("cms_gate_values", {})
+        if cms_gates:
+            avg_gate = torch.stack(list(cms_gates.values())).mean()
+        else:
+            avg_gate = zero
+
+        # Prototype norm from banks (if available)
+        proto_norm = zero
+        proto_ready = zero
+        memory_entropy = zero
+        if self.decoder.prototype is not None:
+            bank = self.decoder.prototype
+            fast_norm = bank.fast_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+            slow_norm = bank.slow_prototypes.to(device=device, dtype=dtype).norm(dim=-1).mean()
+            proto_norm = 0.5 * (fast_norm + slow_norm)
+            fast_ready = (bank.fast_counts > 1e-6).float().mean()
+            slow_ready = (bank.slow_counts > 1e-6).float().mean()
+            proto_ready = (0.5 * (fast_ready + slow_ready)).to(device=device, dtype=dtype)
+
+            # Compute memory entropy from prototype attention weights
+            attn_fast = decoder_info.get("prototype_sim_fast")
+            attn_slow = decoder_info.get("prototype_sim_slow")
+            if attn_fast is not None and attn_slow is not None:
+                def _entropy(attn):
+                    safe = attn.clamp(min=1e-6)
+                    return -(safe * safe.log()).sum(dim=-1).mean()
+                memory_entropy = (0.5 * (_entropy(attn_fast) + _entropy(attn_slow))).to(
+                    device=device, dtype=dtype
+                )
+
+        # Prototype mix
+        proto_mix = decoder_info.get("prototype_mix", zero)
+        if torch.is_tensor(proto_mix):
+            proto_mix = proto_mix.to(device=device, dtype=dtype)
+        else:
+            proto_mix = torch.tensor(float(proto_mix), device=device, dtype=dtype)
+
+        return {
+            "used_nested": torch.ones((), device=device, dtype=dtype),
+            "delta_mean": zero,               # no refiner delta in v2
+            "prototype_norm": proto_norm,
+            "memory_mix": proto_mix,
+            "memory_entropy": memory_entropy,
+            "memory_quality": torch.ones((), device=device, dtype=dtype),
+            "memory_ready_ratio": proto_ready,
+            "residual_gate": avg_gate,
+        }
+
+    def forward(self, x: torch.Tensor, use_nested: bool = False) -> Dict[str, torch.Tensor]:
+        input_size = x.shape[-2:]
+        features, nl_info = self.encoder(x, return_nested_info=True)
+        if len(features) != 4:
+            raise RuntimeError(f"Expected 4 feature maps, got {len(features)}")
+
+        fused, aux_feat, decoder_info = self.decoder(features)
+        fused = self.dropout(fused)
+        logits = self.seg_head(fused)
+        aux_logits = self.aux_head(aux_feat)
+
+        logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
+        aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
+
+        nested_active = bool(use_nested and self.enable_nested)
+        nested_info = self._build_nested_info(decoder_info, logits.device, logits.dtype)
+        if not nested_active:
+            # Zero out nested_info when not active (engine meters still work)
+            zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
+            nested_info = {k: zero for k in nested_info}
+
+        # nested_cache: engine uses this to decide if prototype update is needed
+        # and passes it to update_nested_prototypes()
+        # Always return proto_cache so prototypes can pre-warm before
+        # nested_start_epoch, avoiding sudden distribution shift.
+        proto_cache = decoder_info.get("proto_cache")
+
+        return {
+            "logits": logits,
+            "coarse_logits": logits,  # same as logits (no separate coarse in v2)
+            "aux_logits": aux_logits,
+            "nested_info": nested_info,
+            "nested_cache": proto_cache,
+            "nl_info": nl_info,
+            "decoder_info": decoder_info,
+        }
+
+    @torch.no_grad()
+    def update_nested_prototypes(
+        self,
+        nested_cache,
+        momentum: float = 0.03,
+        max_norm: Optional[float] = None,
+    ):
+        """Bridge for engine compatibility.
+
+        The engine calls: model.update_nested_prototypes(outputs["nested_cache"], ...)
+        We forward to CMSDecoder.update_prototypes() which uses the bank's
+        configured momentum values (fast_momentum / slow_momentum).
+        """
+        if nested_cache is None or self.decoder.prototype is None:
+            return
+        self.decoder.prototype.update_prototypes(nested_cache)
+
+
+# =============================================================================
+# Loss wrapper — NL surprise + prototype diversity regularization
+# =============================================================================
+
+
+class NLLossWrapper(nn.Module):
+    """StrongBaselineLoss + auxiliary surprise loss (Level 2a) +
+    prototype diversity loss (Level 2c).
+
+    Surprise drives the encoder's inner-loop reconstructor.
+    Prototype diversity prevents K prototypes from collapsing.
+    """
+
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        surprise_weight: float = 0.05,
+        diversity_weight: float = 0.01,
+    ):
+        super().__init__()
+        self.base = base_loss
+        self.surprise_weight = float(surprise_weight)
+        self.diversity_weight = float(diversity_weight)
+
+    def _prototype_diversity_loss(self, outputs: Dict) -> torch.Tensor:
+        """Penalize prototype collapse: encourage pairwise dissimilarity."""
+        decoder_info = outputs.get("decoder_info")
+        if decoder_info is None:
+            return torch.zeros((), device=outputs["logits"].device,
+                               dtype=outputs["logits"].dtype)
+
+        proto_cache = decoder_info.get("proto_cache")
+        if proto_cache is None:
+            return torch.zeros((), device=outputs["logits"].device,
+                               dtype=outputs["logits"].dtype)
+
+        # Compute on fast prototypes similarity matrix
+        sim_fast = proto_cache.get("attn_fast")
+        sim_slow = proto_cache.get("attn_slow")
+        if sim_fast is None or sim_slow is None:
+            return torch.zeros((), device=outputs["logits"].device,
+                               dtype=outputs["logits"].dtype)
+
+        # Diversity = encourage uniform attention (high entropy)
+        # Low entropy = collapsed to single prototype
+        def _neg_entropy(attn):
+            # attn: (B, K) — softmax attention over prototypes
+            safe = attn.clamp(min=1e-6)
+            ent = -(safe * safe.log()).sum(dim=-1).mean()
+            # Negate: higher entropy = lower loss
+            return -ent
+
+        loss = 0.5 * (_neg_entropy(sim_fast) + _neg_entropy(sim_slow))
+        return loss
+
+    def forward(self, outputs, targets: torch.Tensor, return_components: bool = False):
+        if return_components:
+            total, components = self.base(outputs, targets, return_components=True)
+        else:
+            total = self.base(outputs, targets, return_components=False)
+            components = {}
+
+        # --- Surprise loss (NL inner-loop, from encoder) ---
+        nl_info = outputs.get("nl_info", {}) if isinstance(outputs, dict) else {}
+        surprise_total = torch.zeros((), device=total.device, dtype=total.dtype)
+        num_stages = 0
+        for _, info in (nl_info or {}).items():
+            aux = info.get("aux_surprise", None) if isinstance(info, dict) else None
+            if aux is None:
+                continue
+            if torch.is_tensor(aux):
+                surprise_total = surprise_total + aux.to(dtype=total.dtype)
+                num_stages += 1
+
+        if num_stages > 0:
+            surprise_total = surprise_total / num_stages
+            total = total + self.surprise_weight * surprise_total
+
+        # --- Prototype diversity loss ---
+        if isinstance(outputs, dict) and self.diversity_weight > 0:
+            div_loss = self._prototype_diversity_loss(outputs)
+            total = total + self.diversity_weight * div_loss
+        else:
+            div_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+
+        if return_components:
+            components["loss_surprise"] = float(surprise_total.detach().item())
+            components["loss_diversity"] = float(div_loss.detach().item())
+            components["loss_total"] = float(total.detach().item())
+            return total, components
+        return total
+
+
+# =============================================================================
+# Argparse
+# =============================================================================
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Nested-Learning PolyMemnet v2 training (Strategy B + CMS Decoder)."
+    )
+    # Data
+    parser.add_argument("--dataset", choices=["kvasir", "glas"], default="kvasir")
+    parser.add_argument("--file-path", default="")
+    parser.add_argument("--save-root", default="")
+    parser.add_argument(
+        "--image-size", type=int, nargs=2, default=(384, 384), metavar=("H", "W")
+    )
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+
+    # Backbone
+    parser.add_argument(
+        "--encoder-name",
+        choices=[
+            "tiny_convnext",
+            "convnext_tiny",
+            "convnext_small",
+            "convnext_base",
+            "convnext_large",
+            "pvtv2_b2",
+            "pvtv2_b5",
+            "convnextv2_tiny",
+            "convnextv2_base",
+            "convnextv2_large",
+            "swinv2_tiny",
+            "swinv2_small",
+            "swinv2_base",
+        ],
+        default="pvtv2_b2",
+    )
+    parser.add_argument("--use-pretrained", action="store_true")
+    parser.add_argument("--strict-pretrained", action="store_true")
+    parser.add_argument("--pretrained-cache-dir", default="")
+    parser.add_argument("--decoder-channels", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--init-checkpoint", default="")
+
+    # --- Self-Modifying Encoder (Level 2a NL) ---
+    parser.add_argument("--nl-inner-steps", type=int, nargs=4, default=[1, 2, 3, 4])
+    parser.add_argument("--nl-inner-lr", type=float, default=0.01)
+    parser.add_argument("--nl-apply-stages", type=int, nargs="+", default=[2, 3])
+    parser.add_argument("--nl-freeze-backbone", action="store_true")
+    parser.add_argument("--nl-modifier-expansion", type=int, default=2)
+    parser.add_argument("--nl-dropout", type=float, default=0.1)
+    parser.add_argument("--nl-surprise-weight", type=float, default=0.05)
+
+    # --- CMS Decoder (Level 2b memory + Level 2c prototype) ---
+    parser.add_argument("--enable-nested", action="store_true")
+    parser.add_argument("--nested-start-epoch", type=int, default=20)
+    parser.add_argument(
+        "--cms-levels", type=int, nargs="+", default=[0, 1, 2, 3],
+        help="FPN levels to apply CMS memory (0=p2, 1=p3, 2=p4, 3=p5)",
+    )
+    parser.add_argument("--memory-dim", type=int, default=64)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--gate-init-bias", type=float, default=-2.0)
+    parser.add_argument("--num-prototypes", type=int, default=8)
+    parser.add_argument("--prototype-dim", type=int, default=128)
+    parser.add_argument("--fast-momentum", type=float, default=0.03)
+    parser.add_argument("--slow-momentum", type=float, default=0.0075)
+    parser.add_argument("--diversity-weight", type=float, default=0.01)
+
+    # --- Engine-level nested control ---
+    parser.add_argument(
+        "--skip-nested-if-hurts",
+        dest="skip_nested_if_hurts",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-skip-nested-if-hurts",
+        dest="skip_nested_if_hurts",
+        action="store_false",
+    )
+    parser.set_defaults(skip_nested_if_hurts=True)
+    parser.add_argument("--nested-skip-margin", type=float, default=0.002)
+    parser.add_argument("--nested-momentum", type=float, default=0.03)
+    parser.add_argument("--nested-max-norm", type=float, default=1.0)
+
+    # Split + optimization
+    parser.add_argument("--protocol", choices=["strict", "kfold"], default="strict")
+    parser.add_argument("--fold-index", type=int, default=0)
+    parser.add_argument("--num-folds", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--encoder-lr", type=float, default=1e-4)
+    parser.add_argument("--decoder-lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65],
+    )
+
+    # Eval / TTA / EMA
+    parser.add_argument("--use-ema", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--use-tta", action="store_true")
+    parser.add_argument("--tta-scales", type=float, nargs="+", default=[1.0, 0.75, 1.25])
+    parser.add_argument(
+        "--eval-nested-mode", choices=["auto", "on", "off"], default="auto"
+    )
+    parser.add_argument(
+        "--test-nested-mode", choices=["auto", "on", "off"], default="auto"
+    )
+    parser.add_argument("--patience", type=int, default=5)
+
+    # Data sampling
+    parser.add_argument("--small-polyp-sampling-power", type=float, default=0.25)
+    parser.add_argument(
+        "--stratified-split", dest="stratified_split", action="store_true"
+    )
+    parser.add_argument(
+        "--no-stratified-split", dest="stratified_split", action="store_false"
+    )
+    parser.set_defaults(stratified_split=True)
+    parser.add_argument(
+        "--glas-val-ratio",
+        type=float,
+        default=0.0,
+        help="GlaS: fraction of train to hold out as val (0 = use testA as val)",
+    )
+
+    # Smoke-test helpers
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a minimal sanity-check loop (overrides epochs/steps).",
+    )
+    parser.add_argument(
+        "--smoke-max-steps", type=int, default=2, help="Batches per epoch in smoke-test."
+    )
+    parser.add_argument(
+        "--no-amp",
+        dest="use_amp",
+        action="store_false",
+        help="Disable mixed precision (useful for debugging NL inner loop).",
+    )
+    parser.set_defaults(use_amp=True)
+    return parser
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+
+def _resolve_nested_usage(mode: str, nested_active: bool) -> bool:
+    if mode == "auto":
+        return bool(nested_active)
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    raise ValueError(f"Unsupported nested usage mode: {mode}")
+
+
+def _limit_loader_steps(loader, max_steps: int):
+    """Yield only the first ``max_steps`` batches of ``loader``."""
+
+    class _LimitedLoader:
+        def __init__(self, inner, limit):
+            self._inner = inner
+            self._limit = limit
+
+        def __iter__(self):
+            for idx, batch in enumerate(self._inner):
+                if idx >= self._limit:
+                    break
+                yield batch
+
+        def __len__(self):
+            return min(len(self._inner), self._limit)
+
+    return _LimitedLoader(loader, max_steps)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    args = build_parser().parse_args()
+
+    # --- Dataset-specific defaults ---
+    if args.dataset == "glas":
+        if not args.file_path:
+            args.file_path = "datasets/Warwick_QU_Dataset"
+        if not args.save_root:
+            args.save_root = "outputs/glas_nested_learning_v2"
+    else:
+        if not args.file_path:
+            args.file_path = "datasets/TrainDataset"
+        if not args.save_root:
+            args.save_root = "outputs/kvasir_nested_learning_v2"
+
+    if args.smoke_test:
+        args.epochs = max(1, min(args.epochs, 1))
+        args.warmup_epochs = 0
+        args.patience = args.epochs
+        args.num_workers = 0
+
+    os.makedirs(args.save_root, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # --- Build dataloaders ---
+    test_loaders = {}
+    if args.dataset == "glas":
+        (
+            train_loader,
+            val_loader,
+            testA_loader,
+            testB_loader,
+            meta_info,
+        ) = build_glas_dataloaders(
+            root_dir=args.file_path,
+            image_size=tuple(args.image_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            train_augmentation=True,
+            val_ratio=args.glas_val_ratio,
+        )
+        test_loaders["testA"] = testA_loader
+        test_loaders["testB"] = testB_loader
+    else:
+        train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
+            file_path=args.file_path,
+            image_size=tuple(args.image_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            protocol=args.protocol,
+            fold_index=args.fold_index,
+            num_folds=args.num_folds,
+            train_augmentation=True,
+            stratified_split=args.stratified_split,
+            small_polyp_sampling_power=args.small_polyp_sampling_power,
+        )
+        test_loaders["test"] = test_loader
+
+    if args.smoke_test:
+        train_loader = _limit_loader_steps(train_loader, args.smoke_max_steps)
+        val_loader = _limit_loader_steps(val_loader, args.smoke_max_steps)
+        test_loaders = {
+            name: _limit_loader_steps(loader, args.smoke_max_steps)
+            for name, loader in test_loaders.items()
+        }
+
+    pretrained_cache_dir = (
+        args.pretrained_cache_dir.strip()
+        or os.path.join(args.save_root, ".torch_cache")
+    )
+
+    model_kwargs = dict(
+        encoder_name=args.encoder_name,
+        use_pretrained=args.use_pretrained,
+        strict_pretrained=args.strict_pretrained,
+        pretrained_cache_dir=pretrained_cache_dir,
+        img_size=args.image_size[0],
+        decoder_channels=args.decoder_channels,
+        dropout=args.dropout,
+        nl_inner_steps=list(args.nl_inner_steps),
+        nl_inner_lr=args.nl_inner_lr,
+        nl_apply_stages=list(args.nl_apply_stages),
+        nl_freeze_backbone=args.nl_freeze_backbone,
+        nl_modifier_expansion=args.nl_modifier_expansion,
+        nl_dropout=args.nl_dropout,
+        # CMS Decoder
+        enable_nested=args.enable_nested,
+        cms_levels=list(args.cms_levels),
+        memory_dim=args.memory_dim,
+        num_heads=args.num_heads,
+        gate_init_bias=args.gate_init_bias,
+        num_prototypes=args.num_prototypes,
+        prototype_dim=args.prototype_dim,
+        fast_momentum=args.fast_momentum,
+        slow_momentum=args.slow_momentum,
+    )
+    model = NestedPolypModel(**model_kwargs).to(device)
+    criterion = NLLossWrapper(
+        StrongBaselineLoss(),
+        surprise_weight=args.nl_surprise_weight,
+        diversity_weight=args.diversity_weight,
+    )
+
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location=device)
+        state_dict = (
+            checkpoint["state_dict"]
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+            else checkpoint
+        )
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"[NestedPolyp v2] Loaded init checkpoint: {args.init_checkpoint} | "
+            f"missing={list(incompatible.missing_keys)[:10]} | "
+            f"unexpected={list(incompatible.unexpected_keys)[:10]}"
+        )
+
+    meta_info["model"] = {
+        **{k: v for k, v in model_kwargs.items() if k != "pretrained_cache_dir"},
+        "pretrained_loaded": bool(getattr(model, "pretrained_loaded", False)),
+        "architecture": "NestedPolypModel_v2_CMSDecoder",
+    }
+    with open(os.path.join(args.save_root, "meta_info.json"), "w", encoding="utf-8") as f:
+        json.dump(meta_info, f, indent=2)
+
+    param_groups = model.get_parameter_groups()
+    encoder_params = param_groups["encoder"]
+    decoder_params = param_groups["decoder"]
+    if not encoder_params or not decoder_params:
+        raise RuntimeError("Empty parameter group detected.")
+
+    print(
+        f"[NestedPolyp v2] encoder={args.encoder_name} | pretrained={args.use_pretrained} "
+        f"| pretrained_loaded={getattr(model, 'pretrained_loaded', False)} "
+        f"| apply_stages={args.nl_apply_stages} | inner_steps={args.nl_inner_steps} "
+        f"| enable_nested={args.enable_nested}"
+    )
+    print(
+        f"[NestedPolyp v2] CMS: levels={args.cms_levels} | mem_dim={args.memory_dim} "
+        f"| heads={args.num_heads} | prototypes={args.num_prototypes} "
+        f"| proto_dim={args.prototype_dim}"
+    )
+    print(
+        f"[NestedPolyp v2] params: encoder={sum(p.numel() for p in encoder_params):,} | "
+        f"decoder={sum(p.numel() for p in decoder_params):,} | "
+        f"total={sum(p.numel() for p in model.parameters()):,}"
+    )
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": encoder_params, "lr": args.encoder_lr},
+            {"params": decoder_params, "lr": args.decoder_lr},
+        ],
+        weight_decay=args.weight_decay,
+    )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.25,
+        total_iters=max(args.warmup_epochs, 1),
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(args.epochs - args.warmup_epochs, 1),
+        eta_min=1e-6,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[args.warmup_epochs],
+    )
+
+    scaler = GradScaler("cuda", enabled=args.use_amp and torch.cuda.is_available())
+    ema = ModelEMA(model, decay=args.ema_decay) if args.use_ema else None
+
+    best_state = None
+    best_val = {"iou": -1.0, "dice": -1.0, "threshold": 0.5}
+    best_nested_active = False
+    epochs_without_improve = 0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        nested_active = bool(
+            args.enable_nested and epoch >= args.nested_start_epoch
+        )
+        val_nested_active = _resolve_nested_usage(args.eval_nested_mode, nested_active)
+        train_metrics = train_one_epoch_clean(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            epoch=epoch,
+            scaler=scaler,
+            use_amp=args.use_amp,
+            grad_clip=1.0,
+            ema=ema,
+            print_freq=20,
+            use_nested=nested_active,
+            skip_nested_if_hurts=args.skip_nested_if_hurts,
+            nested_skip_margin=args.nested_skip_margin,
+            nested_momentum=args.nested_momentum,
+            nested_max_norm=args.nested_max_norm,
+        )
+        scheduler.step()
+
+        eval_model = ema.ema if ema is not None else model
+        val_best = threshold_sweep_clean(
+            model=eval_model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+            thresholds=args.thresholds,
+            use_amp=args.use_amp,
+            use_tta=args.use_tta,
+            tta_scales=args.tta_scales,
+            use_nested=val_nested_active,
+        )
+
+        test_metrics_epoch = {}
+        if args.dataset == "glas":
+            best_thr = val_best["threshold"]
+            for split_name, loader in test_loaders.items():
+                split_metrics = evaluate_clean(
+                    model=eval_model,
+                    loader=loader,
+                    criterion=criterion,
+                    device=device,
+                    threshold=best_thr,
+                    use_amp=args.use_amp,
+                    use_tta=args.use_tta,
+                    tta_scales=args.tta_scales,
+                    use_nested=val_nested_active,
+                )
+                test_metrics_epoch[split_name] = split_metrics
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        history_entry = {
+            "epoch": epoch,
+            "lr": current_lr,
+            "nested_active": nested_active,
+            "val_nested_active": val_nested_active,
+            "train": train_metrics,
+            "val": val_best,
+        }
+        if test_metrics_epoch:
+            history_entry["test"] = test_metrics_epoch
+        history.append(history_entry)
+
+        test_log = ""
+        for split_name, m in test_metrics_epoch.items():
+            test_log += (
+                f" | {split_name}_iou={m['iou']:.4f}"
+                f" | {split_name}_dice={m['dice']:.4f}"
+            )
+        print(
+            f"\n[Epoch {epoch}] lr={current_lr:.7f} | "
+            f"train_iou={train_metrics['iou']:.4f} | "
+            f"val_iou={val_best['iou']:.4f} | val_dice={val_best['dice']:.4f} | "
+            f"best_thr={val_best['threshold']:.2f} | "
+            f"nested_active={nested_active} | val_nested={val_nested_active}"
+            f"{test_log}\n"
+        )
+
+        improved = False
+        if val_best["iou"] > best_val["iou"]:
+            improved = True
+        elif val_best["iou"] == best_val["iou"] and val_best["dice"] > best_val["dice"]:
+            improved = True
+
+        if improved:
+            best_val = val_best
+            best_nested_active = val_nested_active
+            best_state = copy.deepcopy(
+                (ema.ema if ema is not None else model).state_dict()
+            )
+            torch.save(
+                {
+                    "state_dict": best_state,
+                    "best_val": best_val,
+                    "best_nested_active": best_nested_active,
+                    "model_kwargs": {
+                        k: v for k, v in model_kwargs.items() if k != "pretrained_cache_dir"
+                    },
+                    "train_config": vars(args),
+                },
+                os.path.join(args.save_root, "best_model.pth"),
+            )
+            epochs_without_improve = 0
+        else:
+            epochs_without_improve += 1
+
+        with open(os.path.join(args.save_root, "history.json"), "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        if epochs_without_improve >= args.patience:
+            print(f"Early stopping at epoch {epoch} (patience={args.patience}).")
+            break
+
+    if best_state is None:
+        print("[NestedPolyp v2] No improvement over initial val; saving final state instead.")
+        best_state = copy.deepcopy(
+            (ema.ema if ema is not None else model).state_dict()
+        )
+
+    model.load_state_dict(best_state)
+    test_nested_active = _resolve_nested_usage(args.test_nested_mode, best_nested_active)
+
+    all_test_metrics = {}
+    for split_name, loader in test_loaders.items():
+        metrics = test_clean(
+            model=model,
+            loader=loader,
+            criterion=criterion,
+            device=device,
+            save_dir=os.path.join(args.save_root, f"predictions_{split_name}"),
+            threshold=best_val["threshold"],
+            use_amp=args.use_amp,
+            use_tta=args.use_tta,
+            tta_scales=args.tta_scales,
+            use_nested=test_nested_active,
+        )
+        all_test_metrics[split_name] = metrics
+        print(
+            f"[{split_name}] IoU: {metrics['iou']:.4f} | Dice: {metrics['dice']:.4f}"
+        )
+
+    with open(os.path.join(args.save_root, "test_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(all_test_metrics, f, indent=2)
+
+    print(f"\nBest validation IoU: {best_val['iou']:.4f}")
+    print(f"Best validation Dice: {best_val['dice']:.4f}")
+    print(f"Best threshold: {best_val['threshold']:.2f}")
+    print(f"Best nested active: {best_nested_active}")
+    print(f"Final test nested active: {test_nested_active}")
+
+
+if __name__ == "__main__":
+    main()

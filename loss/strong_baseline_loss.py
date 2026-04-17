@@ -117,10 +117,11 @@ class StrongBaselineLoss(nn.Module):
         loss_lovasz = self.lovasz(logits, targets)
         loss_ft = self.focal_tversky(logits, targets)
         loss_dice = self.dice(logits, targets)
+        _zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
         if aux_logits is not None:
             loss_aux = 0.5 * self.bce(aux_logits, targets) + 0.5 * self.dice(aux_logits, targets)
         else:
-            loss_aux = logits.sum() * 0.0
+            loss_aux = _zero
         if coarse_logits is not None:
             loss_coarse = 0.5 * self.bce(coarse_logits, targets) + 0.5 * self.dice(coarse_logits, targets)
             with torch.no_grad():
@@ -131,8 +132,8 @@ class StrongBaselineLoss(nn.Module):
             trust_denom = confidence.sum().clamp(min=1e-6)
             loss_trust = (torch.abs(refined_probs - coarse_probs.detach()) * confidence).sum() / trust_denom
         else:
-            loss_coarse = logits.sum() * 0.0
-            loss_trust = logits.sum() * 0.0
+            loss_coarse = _zero
+            loss_trust = _zero
 
         total = (
             self.bce_weight * loss_bce
