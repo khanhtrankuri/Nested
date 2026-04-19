@@ -38,7 +38,10 @@ from engine.train_eval_clean import (
     train_one_epoch_clean,
 )
 from loss.strong_baseline_loss import StrongBaselineLoss
-from model.backbones.self_modifying_encoder import SelfModifyingEncoder
+from model.backbones.self_modifying_encoder_cms import (
+    CMSSelfModifyingEncoder,
+    DEFAULT_STAGE_CONFIG,
+)
 from model.backbones.strong_baseline import ConvBNAct, build_encoder
 from model.backbones.cms_decoder import CMSDecoder
 
@@ -67,13 +70,10 @@ class NestedPolypModel(nn.Module):
         img_size: Optional[int] = None,
         decoder_channels: int = 128,
         dropout: float = 0.1,
-        # NL encoder params
-        nl_inner_steps: Optional[List[int]] = None,
-        nl_inner_lr: float = 0.01,
-        nl_apply_stages: Optional[List[int]] = None,
-        nl_freeze_backbone: bool = False,
-        nl_modifier_expansion: int = 2,
-        nl_dropout: float = 0.1,
+        # CMS Self-Modifying Encoder params
+        stage_configs: Optional[List[Dict]] = None,
+        backbone_lr_decay: float = 0.5,
+        unfreeze_schedule: Optional[Dict[str, int]] = None,
         # CMS Decoder params
         enable_nested: bool = False,
         cms_levels: Optional[List[int]] = None,
@@ -101,26 +101,27 @@ class NestedPolypModel(nn.Module):
         self.pretrained_loaded = bool(getattr(backbone, "pretrained_loaded", False))
         self.backbone_channels = list(backbone.out_channels)
 
-        if nl_inner_steps is None:
-            nl_inner_steps = [1, 2, 3, 4]
-        if len(nl_inner_steps) != 4:
-            raise ValueError(f"nl_inner_steps must have 4 values, got {nl_inner_steps}")
-        if nl_apply_stages is None:
-            nl_apply_stages = [2, 3]
+        if stage_configs is None:
+            stage_configs = DEFAULT_STAGE_CONFIG
+        if len(stage_configs) != 4:
+            raise ValueError(
+                f"stage_configs must have 4 entries (c2..c5), got {len(stage_configs)}"
+            )
         if cms_levels is None:
             cms_levels = [0, 1, 2, 3]
+        if unfreeze_schedule is None:
+            unfreeze_schedule = {"deep": 0, "mid": 8, "shallow": 16}
 
-        self.nl_apply_stages = list(nl_apply_stages)
+        self.stage_configs = list(stage_configs)
+        self.unfreeze_schedule = dict(unfreeze_schedule)
+        self.backbone_lr_decay = float(backbone_lr_decay)
 
-        self.encoder = SelfModifyingEncoder(
+        self.encoder = CMSSelfModifyingEncoder(
             backbone=backbone,
             feature_channels=self.backbone_channels,
-            inner_steps_schedule=nl_inner_steps,
-            inner_lr=nl_inner_lr,
-            apply_stages=self.nl_apply_stages,
-            freeze_backbone=nl_freeze_backbone,
-            modifier_expansion=nl_modifier_expansion,
-            dropout=nl_dropout,
+            stage_configs=self.stage_configs,
+            backbone_lr_decay=self.backbone_lr_decay,
+            unfreeze_schedule=self.unfreeze_schedule,
         )
 
         self.decoder = CMSDecoder(
@@ -147,12 +148,6 @@ class NestedPolypModel(nn.Module):
             ConvBNAct(c5_channels, decoder_channels // 2),
             nn.Conv2d(decoder_channels // 2, 1, 1),
         )
-
-    def get_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
-        encoder_params = list(self.encoder.parameters())
-        encoder_param_ids = {id(p) for p in encoder_params}
-        decoder_params = [p for p in self.parameters() if id(p) not in encoder_param_ids]
-        return {"encoder": encoder_params, "decoder": decoder_params}
 
     def _build_nested_info(
         self, decoder_info: Dict, device: torch.device, dtype: torch.dtype,
@@ -410,13 +405,22 @@ def build_parser():
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--init-checkpoint", default="")
 
-    # --- Self-Modifying Encoder (Level 2a NL) ---
-    parser.add_argument("--nl-inner-steps", type=int, nargs=4, default=[1, 2, 3, 4])
-    parser.add_argument("--nl-inner-lr", type=float, default=0.01)
-    parser.add_argument("--nl-apply-stages", type=int, nargs="+", default=[2, 3])
-    parser.add_argument("--nl-freeze-backbone", action="store_true")
-    parser.add_argument("--nl-modifier-expansion", type=int, default=2)
-    parser.add_argument("--nl-dropout", type=float, default=0.1)
+    # --- CMS Self-Modifying Encoder (Level 2a NL + CMS hierarchy) ---
+    parser.add_argument(
+        "--nl-stage-config-preset",
+        choices=["default", "conservative", "aggressive", "custom"],
+        default="default",
+        help="Preset cho stage_configs. 'custom' = DEFAULT_STAGE_CONFIG + override CLI.",
+    )
+    parser.add_argument("--nl-c4-inner-steps", type=int, default=2)
+    parser.add_argument("--nl-c5-inner-steps", type=int, default=4)
+    parser.add_argument("--nl-c4-inner-lr", type=float, default=5e-3)
+    parser.add_argument("--nl-c5-inner-lr", type=float, default=2e-2)
+    parser.add_argument("--backbone-lr-decay", type=float, default=0.5)
+    parser.add_argument("--unfreeze-deep-epoch", type=int, default=0)
+    parser.add_argument("--unfreeze-mid-epoch", type=int, default=8)
+    parser.add_argument("--unfreeze-shallow-epoch", type=int, default=16)
+    parser.add_argument("--adaptor-lr", type=float, default=3e-4)
     parser.add_argument("--nl-surprise-weight", type=float, default=0.05)
 
     # --- CMS Decoder (Level 2b memory + Level 2c prototype) ---
@@ -529,6 +533,75 @@ def _resolve_nested_usage(mode: str, nested_active: bool) -> bool:
     raise ValueError(f"Unsupported nested usage mode: {mode}")
 
 
+def _build_stage_configs(args) -> List[Dict]:
+    """Map --nl-stage-config-preset (+ overrides) to a per-stage config list."""
+    if args.nl_stage_config_preset == "default":
+        return copy.deepcopy(DEFAULT_STAGE_CONFIG)
+
+    if args.nl_stage_config_preset == "conservative":
+        return [
+            {"mode": "none"},
+            {"mode": "none"},
+            {
+                "mode": "light",
+                "lora_rank": 8,
+                "residual_init": 0.05,
+            },
+            {
+                "mode": "full",
+                "inner_steps": 2,
+                "inner_lr": 1e-2,
+                "inner_momentum": 0.9,
+                "modifier_expansion": 2,
+                "surprise_type": "full",
+                "persist_momentum": True,
+                "residual_init": 0.05,
+            },
+        ]
+
+    if args.nl_stage_config_preset == "aggressive":
+        return [
+            {"mode": "light", "lora_rank": 4, "residual_init": 0.03},
+            {
+                "mode": "full",
+                "inner_steps": 1,
+                "inner_lr": 2e-3,
+                "inner_momentum": 0.85,
+                "modifier_expansion": 1,
+                "surprise_type": "consistency",
+                "persist_momentum": False,
+                "residual_init": 0.03,
+            },
+            {
+                "mode": "full",
+                "inner_steps": 3,
+                "inner_lr": 1e-2,
+                "inner_momentum": 0.9,
+                "modifier_expansion": 2,
+                "surprise_type": "full",
+                "persist_momentum": True,
+                "residual_init": 0.05,
+            },
+            {
+                "mode": "full",
+                "inner_steps": 5,
+                "inner_lr": 3e-2,
+                "inner_momentum": 0.95,
+                "modifier_expansion": 4,
+                "surprise_type": "full",
+                "persist_momentum": True,
+                "residual_init": 0.08,
+            },
+        ]
+
+    cfg = copy.deepcopy(DEFAULT_STAGE_CONFIG)
+    cfg[2]["inner_steps"] = int(args.nl_c4_inner_steps)
+    cfg[2]["inner_lr"] = float(args.nl_c4_inner_lr)
+    cfg[3]["inner_steps"] = int(args.nl_c5_inner_steps)
+    cfg[3]["inner_lr"] = float(args.nl_c5_inner_lr)
+    return cfg
+
+
 def _limit_loader_steps(loader, max_steps: int):
     """Yield only the first ``max_steps`` batches of ``loader``."""
 
@@ -631,6 +704,13 @@ def main():
         or os.path.join(args.save_root, ".torch_cache")
     )
 
+    stage_configs = _build_stage_configs(args)
+    unfreeze_schedule = {
+        "deep": int(args.unfreeze_deep_epoch),
+        "mid": int(args.unfreeze_mid_epoch),
+        "shallow": int(args.unfreeze_shallow_epoch),
+    }
+
     model_kwargs = dict(
         encoder_name=args.encoder_name,
         use_pretrained=args.use_pretrained,
@@ -639,12 +719,9 @@ def main():
         img_size=args.image_size[0],
         decoder_channels=args.decoder_channels,
         dropout=args.dropout,
-        nl_inner_steps=list(args.nl_inner_steps),
-        nl_inner_lr=args.nl_inner_lr,
-        nl_apply_stages=list(args.nl_apply_stages),
-        nl_freeze_backbone=args.nl_freeze_backbone,
-        nl_modifier_expansion=args.nl_modifier_expansion,
-        nl_dropout=args.nl_dropout,
+        stage_configs=stage_configs,
+        backbone_lr_decay=float(args.backbone_lr_decay),
+        unfreeze_schedule=unfreeze_schedule,
         # CMS Decoder
         enable_nested=args.enable_nested,
         cms_levels=list(args.cms_levels),
@@ -685,16 +762,30 @@ def main():
     with open(os.path.join(args.save_root, "meta_info.json"), "w", encoding="utf-8") as f:
         json.dump(meta_info, f, indent=2)
 
-    param_groups = model.get_parameter_groups()
-    encoder_params = param_groups["encoder"]
-    decoder_params = param_groups["decoder"]
-    if not encoder_params or not decoder_params:
+    encoder_groups = model.encoder.build_param_groups(
+        base_backbone_lr=args.encoder_lr,
+        adaptor_lr=args.adaptor_lr,
+        modifier_inner_lr_scale=0.5,
+        weight_decay=args.weight_decay,
+    )
+    encoder_param_ids = {id(p) for g in encoder_groups for p in g["params"]}
+    decoder_params = [p for p in model.parameters() if id(p) not in encoder_param_ids]
+    if not encoder_groups or not decoder_params:
         raise RuntimeError("Empty parameter group detected.")
+
+    all_groups = encoder_groups + [
+        {
+            "params": decoder_params,
+            "lr": args.decoder_lr,
+            "weight_decay": args.weight_decay,
+            "name": "decoder",
+        }
+    ]
 
     print(
         f"[NestedPolyp v2] encoder={args.encoder_name} | pretrained={args.use_pretrained} "
         f"| pretrained_loaded={getattr(model, 'pretrained_loaded', False)} "
-        f"| apply_stages={args.nl_apply_stages} | inner_steps={args.nl_inner_steps} "
+        f"| preset={args.nl_stage_config_preset} | unfreeze={unfreeze_schedule} "
         f"| enable_nested={args.enable_nested}"
     )
     print(
@@ -702,19 +793,21 @@ def main():
         f"| heads={args.num_heads} | prototypes={args.num_prototypes} "
         f"| proto_dim={args.prototype_dim}"
     )
+    encoder_total = sum(p.numel() for g in encoder_groups for p in g["params"])
     print(
-        f"[NestedPolyp v2] params: encoder={sum(p.numel() for p in encoder_params):,} | "
+        f"[NestedPolyp v2] params: encoder={encoder_total:,} | "
         f"decoder={sum(p.numel() for p in decoder_params):,} | "
         f"total={sum(p.numel() for p in model.parameters()):,}"
     )
+    print("[Optimizer] Parameter groups:")
+    for g in all_groups:
+        n = sum(p.numel() for p in g["params"])
+        print(
+            f"  {g.get('name', '?'):<28} lr={g['lr']:.2e}  "
+            f"wd={g['weight_decay']:.1e}  params={n:,}"
+        )
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": encoder_params, "lr": args.encoder_lr},
-            {"params": decoder_params, "lr": args.decoder_lr},
-        ],
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(all_groups)
 
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer,
@@ -742,6 +835,10 @@ def main():
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        model.encoder.set_epoch(epoch)
+        if epoch == 1 or epoch % 5 == 0:
+            print(model.encoder.describe())
+
         nested_active = bool(
             args.enable_nested and epoch >= args.nested_start_epoch
         )
