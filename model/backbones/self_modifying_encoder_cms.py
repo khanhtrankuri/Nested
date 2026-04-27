@@ -413,7 +413,7 @@ DEFAULT_STAGE_CONFIG: List[Dict[str, Any]] = [
     # c4 — mid-deep, moderate inner loop
     {
         "mode": "full",
-        "inner_steps": 2,
+        "inner_steps": 3,
         "inner_lr": 5e-3,
         "inner_momentum": 0.9,
         "modifier_expansion": 2,
@@ -424,8 +424,8 @@ DEFAULT_STAGE_CONFIG: List[Dict[str, Any]] = [
     # c5 — deepest, strongest inner loop
     {
         "mode": "full",
-        "inner_steps": 4,
-        "inner_lr": 2e-2,
+        "inner_steps": 6,
+        "inner_lr": 2e-5,
         "inner_momentum": 0.95,
         "modifier_expansion": 4,
         "surprise_type": "full",
@@ -468,7 +468,7 @@ class CMSSelfModifyingEncoder(nn.Module):
         self.backbone_lr_decay = float(backbone_lr_decay)
 
         if stage_configs is None:
-            stage_configs = DEFAULT_STAGE_CONFIG
+            stage_configs = DEFAULT_STAGE_CONFIG 
         assert len(stage_configs) == 4
         self.stage_configs = list(stage_configs)
 
@@ -486,7 +486,7 @@ class CMSSelfModifyingEncoder(nn.Module):
             mode = cfg.get("mode", "none")
             self.stage_modes.append(mode)
             key = f"stage_{idx}"
-            if mode == "none":
+            if mode == "none": 
                 continue
             # Pre-norm để stabilize input cho adaptor/modifier
             self.pre_norms[key] = nn.GroupNorm(min(8, max(1, ch // 4)), ch)
@@ -499,11 +499,11 @@ class CMSSelfModifyingEncoder(nn.Module):
             elif mode == "full":
                 self.stage_modules[key] = CMSSelfModifyingBlock(
                     channels=ch,
-                    inner_steps=int(cfg.get("inner_steps", 2)),
+                    inner_steps=int(cfg.get("inner_steps", 5)),
                     inner_lr=float(cfg.get("inner_lr", 5e-3)),
                     inner_momentum=float(cfg.get("inner_momentum", 0.9)),
                     modifier_expansion=int(cfg.get("modifier_expansion", 2)),
-                    dropout=float(cfg.get("dropout", 0.1)),
+                    dropout=float(cfg.get("dropout", 0.2)),
                     surprise_type=str(cfg.get("surprise_type", "full")),
                     persist_momentum=bool(cfg.get("persist_momentum", True)),
                     residual_init=float(cfg.get("residual_init", 0.05)),

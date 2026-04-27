@@ -34,7 +34,7 @@ from torch import Tensor
 # 1. SURPRISE OBJECTIVES — Internal loss cho self-modification
 # =============================================================================
 
-class SurpriseObjective(nn.Module):
+class SurpriseObjective(nn.Module): 
     """
     Tính Local Surprise Signal (LSS) cho một feature map.
     
@@ -393,7 +393,7 @@ class SelfModifyingEncoder(nn.Module):
         backbone: nn.Module,
         feature_channels: List[int] = [64, 128, 320, 512],
         inner_steps_schedule: List[int] = [1, 2, 3, 4],
-        inner_lr: float = 0.01,
+        inner_lr: float = 0.001,
         apply_stages: Optional[List[int]] = None,
         freeze_backbone: bool = False,
         modifier_expansion: int = 2,

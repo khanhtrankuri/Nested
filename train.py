@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler
 
-from data.load_data_clean import build_clean_dataloaders
+from data.load_data_clean import build_clean_dataloaders, build_presplit_dataloaders
 from data.load_GlaS_dataset import build_glas_dataloaders
 from engine.train_eval_clean import (
     ModelEMA,
@@ -42,6 +42,7 @@ from model.backbones.self_modifying_encoder_cms import (
     CMSSelfModifyingEncoder,
     DEFAULT_STAGE_CONFIG,
 )
+from model.backbones.self_modifying_encoder_minimal import MinimalCMSEncoder
 from model.backbones.strong_baseline import ConvBNAct, build_encoder
 from model.backbones.cms_decoder import CMSDecoder
 
@@ -71,6 +72,7 @@ class NestedPolypModel(nn.Module):
         decoder_channels: int = 128,
         dropout: float = 0.1,
         # CMS Self-Modifying Encoder params
+        encoder_variant: str = "cms",  # "cms" | "minimal"
         stage_configs: Optional[List[Dict]] = None,
         backbone_lr_decay: float = 0.5,
         unfreeze_schedule: Optional[Dict[str, int]] = None,
@@ -116,13 +118,25 @@ class NestedPolypModel(nn.Module):
         self.unfreeze_schedule = dict(unfreeze_schedule)
         self.backbone_lr_decay = float(backbone_lr_decay)
 
-        self.encoder = CMSSelfModifyingEncoder(
-            backbone=backbone,
-            feature_channels=self.backbone_channels,
-            stage_configs=self.stage_configs,
-            backbone_lr_decay=self.backbone_lr_decay,
-            unfreeze_schedule=self.unfreeze_schedule,
-        )
+        if encoder_variant == "minimal":
+            self.encoder = MinimalCMSEncoder(
+                backbone=backbone,
+                feature_channels=self.backbone_channels,
+                use_llrd=False,
+                backbone_lr_decay=self.backbone_lr_decay,
+                use_progressive_unfreeze=True,
+                unfreeze_schedule=self.unfreeze_schedule,
+                c3_adaptor_mode = "light", 
+                use_persistent_momentum = False,  # add learnable adaptor to c3 for better CMS performance (c2 is too low-level for effective adaptation)
+            )
+        else:
+            self.encoder = CMSSelfModifyingEncoder(
+                backbone=backbone,
+                feature_channels=self.backbone_channels,
+                stage_configs=self.stage_configs,
+                backbone_lr_decay=self.backbone_lr_decay,
+                unfreeze_schedule=self.unfreeze_schedule,
+            )
 
         self.decoder = CMSDecoder(
             encoder_channels=self.backbone_channels,
@@ -407,20 +421,26 @@ def build_parser():
 
     # --- CMS Self-Modifying Encoder (Level 2a NL + CMS hierarchy) ---
     parser.add_argument(
+        "--encoder-variant",
+        choices=["cms", "minimal"],
+        default="cms",
+        help="'cms' = CMSSelfModifyingEncoder (full); 'minimal' = MinimalCMSEncoder (CMS ordering only).",
+    )
+    parser.add_argument(
         "--nl-stage-config-preset",
         choices=["default", "conservative", "aggressive", "custom"],
         default="default",
         help="Preset cho stage_configs. 'custom' = DEFAULT_STAGE_CONFIG + override CLI.",
     )
-    parser.add_argument("--nl-c4-inner-steps", type=int, default=2)
-    parser.add_argument("--nl-c5-inner-steps", type=int, default=4)
-    parser.add_argument("--nl-c4-inner-lr", type=float, default=5e-3)
+    parser.add_argument("--nl-c4-inner-steps", type=int, default=3)
+    parser.add_argument("--nl-c5-inner-steps", type=int, default=6)
+    parser.add_argument("--nl-c4-inner-lr", type=float, default=5e-4)
     parser.add_argument("--nl-c5-inner-lr", type=float, default=2e-2)
-    parser.add_argument("--backbone-lr-decay", type=float, default=0.5)
+    parser.add_argument("--backbone-lr-decay", type=float, default=0.65)
     parser.add_argument("--unfreeze-deep-epoch", type=int, default=0)
     parser.add_argument("--unfreeze-mid-epoch", type=int, default=8)
     parser.add_argument("--unfreeze-shallow-epoch", type=int, default=16)
-    parser.add_argument("--adaptor-lr", type=float, default=3e-4)
+    parser.add_argument("--adaptor-lr", type=float, default=5e-4)
     parser.add_argument("--nl-surprise-weight", type=float, default=0.05)
 
     # --- CMS Decoder (Level 2b memory + Level 2c prototype) ---
@@ -430,13 +450,13 @@ def build_parser():
         "--cms-levels", type=int, nargs="+", default=[0, 1, 2, 3],
         help="FPN levels to apply CMS memory (0=p2, 1=p3, 2=p4, 3=p5)",
     )
-    parser.add_argument("--memory-dim", type=int, default=64)
-    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--memory-dim", type=int, default=128)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--gate-init-bias", type=float, default=-2.0)
     parser.add_argument("--num-prototypes", type=int, default=8)
     parser.add_argument("--prototype-dim", type=int, default=128)
-    parser.add_argument("--fast-momentum", type=float, default=0.03)
-    parser.add_argument("--slow-momentum", type=float, default=0.0075)
+    parser.add_argument("--fast-momentum", type=float, default=0.05)
+    parser.add_argument("--slow-momentum", type=float, default=0.003)
     parser.add_argument("--diversity-weight", type=float, default=0.01)
 
     # --- Engine-level nested control ---
@@ -452,7 +472,7 @@ def build_parser():
     )
     parser.set_defaults(skip_nested_if_hurts=True)
     parser.add_argument("--nested-skip-margin", type=float, default=0.002)
-    parser.add_argument("--nested-momentum", type=float, default=0.03)
+    parser.add_argument("--nested-momentum", type=float, default=0.05)
     parser.add_argument("--nested-max-norm", type=float, default=1.0)
 
     # Split + optimization
@@ -462,7 +482,7 @@ def build_parser():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--encoder-lr", type=float, default=1e-4)
     parser.add_argument("--decoder-lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=3e-4)
     parser.add_argument(
         "--thresholds",
         type=float,
@@ -638,7 +658,7 @@ def main():
             args.save_root = "outputs/glas_nested_learning_v2"
     else:
         if not args.file_path:
-            args.file_path = "datasets/TrainDataset"
+            args.file_path = "datasets/Adenocarcinoma"
         if not args.save_root:
             args.save_root = "outputs/kvasir_nested_learning_v2"
 
@@ -676,17 +696,26 @@ def main():
         test_loaders["testA"] = testA_loader
         test_loaders["testB"] = testB_loader
     else:
-        train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
-            file_path=args.file_path,
+        # train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
+        #     file_path=args.file_path,
+        #     image_size=tuple(args.image_size),
+        #     batch_size=args.batch_size,
+        #     num_workers=args.num_workers,
+        #     seed=args.seed,
+        #     protocol=args.protocol,
+        #     fold_index=args.fold_index,
+        #     num_folds=args.num_folds,
+        #     train_augmentation=True,
+        #     stratified_split=args.stratified_split,
+        #     small_polyp_sampling_power=args.small_polyp_sampling_power,
+        # )
+        # test_loaders["test"] = test_loader
+        train_loader, val_loader, test_loader, meta_info = build_presplit_dataloaders(
+            root=args.file_path,
             image_size=tuple(args.image_size),
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            seed=args.seed,
-            protocol=args.protocol,
-            fold_index=args.fold_index,
-            num_folds=args.num_folds,
             train_augmentation=True,
-            stratified_split=args.stratified_split,
             small_polyp_sampling_power=args.small_polyp_sampling_power,
         )
         test_loaders["test"] = test_loader
@@ -719,6 +748,7 @@ def main():
         img_size=args.image_size[0],
         decoder_channels=args.decoder_channels,
         dropout=args.dropout,
+        encoder_variant=args.encoder_variant,
         stage_configs=stage_configs,
         backbone_lr_decay=float(args.backbone_lr_decay),
         unfreeze_schedule=unfreeze_schedule,

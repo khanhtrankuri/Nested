@@ -8,7 +8,13 @@
       "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" -c \"import torch; print\\('torch:', torch.__version__\\); print\\('cuda:', torch.cuda.is_available\\(\\)\\)\")",
       "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name tiny_convnext --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --no-amp --file-path datasets/TrainDataset)",
       "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name tiny_convnext --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --file-path datasets/TrainDataset)",
-      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name pvtv2_b2 --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --enable-nested --nested-start-epoch 1 --file-path datasets/TrainDataset)"
+      "Bash(\"C:/Users/Admin/miniconda3/envs/ai/python.exe\" train.py --smoke-test --smoke-max-steps 2 --batch-size 2 --encoder-name pvtv2_b2 --image-size 128 128 --epochs 1 --warmup-epochs 0 --num-workers 0 --enable-nested --nested-start-epoch 1 --file-path datasets/TrainDataset)",
+      "Read(//home/**)",
+      "Read(//tmp/**)",
+      "Bash(python -c \"from train import build_parser, NestedPolypModel; p = build_parser\\(\\); a = p.parse_args\\([]\\); print\\('encoder_variant default:', a.encoder_variant\\); print\\('OK'\\)\")",
+      "Bash(/mnt/data/khanhtl/miniconda3/bin/python -c ' *)",
+      "Bash(/mnt/data/khanhtl/miniconda3/envs/NL/bin/python -c ' *)",
+      "Bash(/mnt/data/khanhtl/miniconda3/envs/ai/bin/python -c ' *)"
     ]
   }
 }

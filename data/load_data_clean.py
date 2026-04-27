@@ -35,18 +35,42 @@ def _list_files(folder_path: str) -> List[str]:
     return file_names
 
 
-def _validate_pairs(image_dir: str, mask_dir: str) -> List[str]:
+def _strip_mask_suffix(name: str) -> str:
+    """Bỏ hậu tố _mask trước phần mở rộng. VD: 'foo_mask.png' -> 'foo.png'."""
+    base, ext = os.path.splitext(name)
+    if base.endswith("_mask"):
+        return base[:-5] + ext
+    return name
+
+
+def _validate_pairs(image_dir: str, mask_dir: str) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Kiểm tra image/mask khớp nhau, hỗ trợ mask có hậu tố _mask.
+
+    Returns:
+        image_names: danh sách tên file ảnh (dùng làm file_names chính).
+        mask_map: dict {image_name -> mask_file_name}.
+                  Nếu tên giống nhau thì mask_map[x] == x.
+    """
     image_names = _list_files(image_dir)
-    mask_names = _list_files(mask_dir)
-    if image_names != mask_names:
-        missing_masks = sorted(set(image_names) - set(mask_names))
-        missing_images = sorted(set(mask_names) - set(image_names))
+    mask_names  = _list_files(mask_dir)
+
+    normalised_masks = [_strip_mask_suffix(n) for n in mask_names]
+    mask_map = dict(zip(normalised_masks, mask_names))   # norm_name -> raw_mask_name
+
+    image_set  = set(image_names)
+    normed_set = set(normalised_masks)
+
+    if image_set != normed_set:
+        missing_masks  = sorted(image_set  - normed_set)
+        missing_images = sorted(normed_set - image_set)
         raise ValueError(
             "Image/mask files do not match. "
             f"Missing masks: {missing_masks[:5]}. "
             f"Missing images: {missing_images[:5]}."
         )
-    return image_names
+
+    return image_names, mask_map
 
 
 @dataclass
@@ -56,16 +80,32 @@ class SplitInfo:
     test_files: List[str]
 
 
-def _compute_mask_ratio(mask_dir: str, file_name: str) -> float:
-    mask_path = os.path.join(mask_dir, file_name)
+def _compute_mask_ratio(mask_dir: str, mask_file_name: str) -> float:
+    mask_path = os.path.join(mask_dir, mask_file_name)
     with Image.open(mask_path) as mask:
         mask = mask.convert("L")
         mask_np = (np.asarray(mask, dtype=np.float32) > 127).astype(np.float32)
     return float(mask_np.mean())
 
 
-def _build_ratio_dict(mask_dir: str, file_names: Sequence[str]) -> Dict[str, float]:
-    return {file_name: _compute_mask_ratio(mask_dir, file_name) for file_name in file_names}
+def _build_ratio_dict(
+    mask_dir: str,
+    file_names: Sequence[str],
+    mask_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
+    """
+    Tính mask ratio cho mỗi file.
+    mask_map: {image_name -> mask_file_name}. None = tên giống nhau.
+    Key trong dict trả về luôn là image_name (không phải mask_file_name).
+    """
+    mask_map = mask_map or {}
+    return {
+        file_name: _compute_mask_ratio(
+            mask_dir,
+            mask_map.get(file_name, file_name),
+        )
+        for file_name in file_names
+    }
 
 
 def _build_stratify_labels(
@@ -201,50 +241,61 @@ def _build_small_polyp_sampler(
 
 
 class CleanPolypDataset(Dataset):
-    def __init__(self, image_dir: str, mask_dir: str, file_names: Sequence[str], image_size=(384, 384), augment: bool = False, mean=IMAGE_MEAN, std=IMAGE_STD):
+    def __init__(
+        self,
+        image_dir: str,
+        mask_dir: str,
+        file_names: Sequence[str],
+        mask_map: Optional[Dict[str, str]] = None,   # {image_name -> mask_file_name}
+        image_size=(384, 384),
+        augment: bool = False,
+        mean=IMAGE_MEAN,
+        std=IMAGE_STD,
+    ):
         self.image_dir = image_dir
-        self.mask_dir = mask_dir
+        self.mask_dir  = mask_dir
         self.file_names = list(file_names)
+        self.mask_map   = mask_map or {}              # empty = tên giống nhau
         self.image_size = _normalize_image_size(image_size)
         self.augment = augment
         self.mean = mean
-        self.std = std
+        self.std  = std
 
     def __len__(self):
         return len(self.file_names)
 
     def _resize_pair(self, image: Image.Image, mask: Image.Image):
         image = image.resize((self.image_size[1], self.image_size[0]), resample=Image.BILINEAR)
-        mask = mask.resize((self.image_size[1], self.image_size[0]), resample=Image.NEAREST)
+        mask  = mask.resize((self.image_size[1], self.image_size[0]), resample=Image.NEAREST)
         return image, mask
 
     def _apply_flip(self, image, mask):
         if random.random() < 0.5:
             image = ImageOps.mirror(image)
-            mask = ImageOps.mirror(mask)
+            mask  = ImageOps.mirror(mask)
         if random.random() < 0.15:
             image = ImageOps.flip(image)
-            mask = ImageOps.flip(mask)
+            mask  = ImageOps.flip(mask)
         return image, mask
 
     def _apply_affine(self, image, mask):
         angle = random.uniform(-20.0, 20.0)
         image = image.rotate(angle, resample=Image.BILINEAR, fillcolor=0)
-        mask = mask.rotate(angle, resample=Image.NEAREST, fillcolor=0)
+        mask  = mask.rotate(angle,  resample=Image.NEAREST,  fillcolor=0)
         return image, mask
 
     def _apply_random_crop(self, image, mask):
         if random.random() > 0.5:
             return image, mask
         w, h = image.size
-        scale = random.uniform(0.65, 1.0)
-        ratio = random.uniform(0.8, 1.25)
+        scale  = random.uniform(0.65, 1.0)
+        ratio  = random.uniform(0.8, 1.25)
         crop_w = int(min(w, max(w * 0.3, w * scale * ratio ** 0.5)))
         crop_h = int(min(h, max(h * 0.3, h * scale / ratio ** 0.5)))
         x0 = random.randint(0, max(0, w - crop_w))
         y0 = random.randint(0, max(0, h - crop_h))
         image = image.crop((x0, y0, x0 + crop_w, y0 + crop_h))
-        mask = mask.crop((x0, y0, x0 + crop_w, y0 + crop_h))
+        mask  = mask.crop((x0, y0, x0 + crop_w, y0 + crop_h))
         return image, mask
 
     def _apply_color_aug(self, image: Image.Image):
@@ -268,7 +319,7 @@ class CleanPolypDataset(Dataset):
         if apply_specular:
             image_tensor = self._apply_specular(image_tensor)
         mean = torch.tensor(self.mean, dtype=image_tensor.dtype).view(3, 1, 1)
-        std = torch.tensor(self.std, dtype=image_tensor.dtype).view(3, 1, 1)
+        std  = torch.tensor(self.std,  dtype=image_tensor.dtype).view(3, 1, 1)
         image_tensor = (image_tensor - mean) / std
 
         mask_np = np.asarray(mask, dtype=np.float32) / 255.0
@@ -279,25 +330,33 @@ class CleanPolypDataset(Dataset):
         if random.random() > 0.35:
             return image_tensor
         _, h, w = image_tensor.shape
-        yy, xx = torch.meshgrid(torch.linspace(-1.0, 1.0, h), torch.linspace(-1.0, 1.0, w), indexing="ij")
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h),
+            torch.linspace(-1.0, 1.0, w),
+            indexing="ij",
+        )
         overlay = torch.zeros((1, h, w), dtype=image_tensor.dtype)
         for _ in range(random.randint(1, 3)):
-            cx = random.uniform(-0.7, 0.7)
-            cy = random.uniform(-0.7, 0.7)
+            cx      = random.uniform(-0.7, 0.7)
+            cy      = random.uniform(-0.7, 0.7)
             sigma_x = random.uniform(0.05, 0.22)
             sigma_y = random.uniform(0.05, 0.22)
-            amp = random.uniform(0.15, 0.40)
-            gauss = torch.exp(-(((xx - cx) ** 2) / (2 * sigma_x ** 2) + ((yy - cy) ** 2) / (2 * sigma_y ** 2)))
+            amp     = random.uniform(0.15, 0.40)
+            gauss   = torch.exp(
+                -(((xx - cx) ** 2) / (2 * sigma_x ** 2) + ((yy - cy) ** 2) / (2 * sigma_y ** 2))
+            )
             overlay = torch.maximum(overlay, amp * gauss.unsqueeze(0))
         return torch.clamp(image_tensor + overlay, 0.0, 1.0)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        file_name = self.file_names[index]
+        file_name  = self.file_names[index]
         image_path = os.path.join(self.image_dir, file_name)
-        mask_path = os.path.join(self.mask_dir, file_name)
+        # Dùng mask_map để tìm đúng tên file mask (có thể khác tên ảnh)
+        mask_file  = self.mask_map.get(file_name, file_name)
+        mask_path  = os.path.join(self.mask_dir, mask_file)
         with Image.open(image_path) as image, Image.open(mask_path) as mask:
             image = image.convert("RGB")
-            mask = mask.convert("L")
+            mask  = mask.convert("L")
             if self.augment:
                 image, mask = self._apply_flip(image, mask)
                 image, mask = self._apply_random_crop(image, mask)
@@ -307,6 +366,10 @@ class CleanPolypDataset(Dataset):
             image_tensor, mask_tensor = self._to_tensor(image, mask, apply_specular=self.augment)
         return {"image": image_tensor, "mask": mask_tensor, "file_name": file_name}
 
+
+# ---------------------------------------------------------------------------
+# build_clean_dataloaders  (tự split)
+# ---------------------------------------------------------------------------
 
 def build_clean_dataloaders(
     file_path: str,
@@ -322,9 +385,16 @@ def build_clean_dataloaders(
     small_polyp_sampling_power: float = 0.0,
 ):
     image_dir = os.path.join(file_path, "images")
-    mask_dir = os.path.join(file_path, "masks")
-    file_names = _validate_pairs(image_dir, mask_dir)
-    ratio_dict = _build_ratio_dict(mask_dir, file_names) if (stratified_split or small_polyp_sampling_power > 0) else None
+    mask_dir  = os.path.join(file_path, "masks")
+
+    file_names, mask_map = _validate_pairs(image_dir, mask_dir)
+
+    ratio_dict = (
+        _build_ratio_dict(mask_dir, file_names, mask_map)
+        if (stratified_split or small_polyp_sampling_power > 0)
+        else None
+    )
+
     if protocol == "strict":
         split_info = build_strict_split(
             file_names=file_names,
@@ -342,51 +412,43 @@ def build_clean_dataloaders(
     else:
         raise ValueError(f"Unsupported protocol: {protocol}")
 
-    train_ds = CleanPolypDataset(image_dir, mask_dir, split_info.train_files, image_size=image_size, augment=train_augmentation)
-    val_ds = CleanPolypDataset(image_dir, mask_dir, split_info.val_files, image_size=image_size, augment=False)
-    test_ds = CleanPolypDataset(image_dir, mask_dir, split_info.test_files, image_size=image_size, augment=False)
+    train_ds = CleanPolypDataset(image_dir, mask_dir, split_info.train_files, mask_map=mask_map, image_size=image_size, augment=train_augmentation)
+    val_ds   = CleanPolypDataset(image_dir, mask_dir, split_info.val_files,   mask_map=mask_map, image_size=image_size, augment=False)
+    test_ds  = CleanPolypDataset(image_dir, mask_dir, split_info.test_files,  mask_map=mask_map, image_size=image_size, augment=False)
 
-    pin_memory = torch.cuda.is_available()
+    pin_memory         = torch.cuda.is_available()
     persistent_workers = num_workers > 0
-    train_ratio_dict = None if ratio_dict is None else {name: ratio_dict[name] for name in split_info.train_files}
-    train_sampler = None if train_ratio_dict is None else _build_small_polyp_sampler(
-        split_info.train_files,
-        ratio_dict=train_ratio_dict,
-        sampling_power=small_polyp_sampling_power,
+
+    train_ratio_dict = (
+        None if ratio_dict is None
+        else {name: ratio_dict[name] for name in split_info.train_files}
     )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
+    train_sampler = (
+        None if train_ratio_dict is None
+        else _build_small_polyp_sampler(
+            split_info.train_files,
+            ratio_dict=train_ratio_dict,
+            sampling_power=small_polyp_sampling_power,
+        )
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=train_sampler is None,
+                              sampler=train_sampler, num_workers=num_workers,
+                              pin_memory=pin_memory, persistent_workers=persistent_workers)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent_workers)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent_workers)
 
     meta_info = {
         "protocol": protocol,
         "fold_index": fold_index,
         "num_folds": num_folds,
         "num_train": len(train_ds),
-        "num_val": len(val_ds),
-        "num_test": len(test_ds),
+        "num_val":   len(val_ds),
+        "num_test":  len(test_ds),
         "image_size": list(_normalize_image_size(image_size)),
         "seed": seed,
         "stratified_split": bool(stratified_split),
@@ -394,6 +456,10 @@ def build_clean_dataloaders(
     }
     return train_loader, val_loader, test_loader, meta_info
 
+
+# ---------------------------------------------------------------------------
+# build_standalone_loader
+# ---------------------------------------------------------------------------
 
 def build_standalone_loader(
     file_path: str,
@@ -404,20 +470,31 @@ def build_standalone_loader(
     small_polyp_sampling_power: float = 0.0,
 ):
     image_dir = os.path.join(file_path, "images")
-    mask_dir = os.path.join(file_path, "masks")
-    file_names = _validate_pairs(image_dir, mask_dir)
-    ratio_dict = _build_ratio_dict(mask_dir, file_names) if (augment and small_polyp_sampling_power > 0) else None
+    mask_dir  = os.path.join(file_path, "masks")
+
+    file_names, mask_map = _validate_pairs(image_dir, mask_dir)
+
+    ratio_dict = (
+        _build_ratio_dict(mask_dir, file_names, mask_map)
+        if (augment and small_polyp_sampling_power > 0)
+        else None
+    )
+
     dataset = CleanPolypDataset(
         image_dir=image_dir,
         mask_dir=mask_dir,
         file_names=file_names,
+        mask_map=mask_map,
         image_size=image_size,
         augment=augment,
     )
-    sampler = None if ratio_dict is None else _build_small_polyp_sampler(
-        file_names=file_names,
-        ratio_dict=ratio_dict,
-        sampling_power=small_polyp_sampling_power,
+    sampler = (
+        None if ratio_dict is None
+        else _build_small_polyp_sampler(
+            file_names=file_names,
+            ratio_dict=ratio_dict,
+            sampling_power=small_polyp_sampling_power,
+        )
     )
     loader = DataLoader(
         dataset,
@@ -436,3 +513,104 @@ def build_standalone_loader(
         "small_polyp_sampling_power": float(small_polyp_sampling_power),
     }
     return loader, meta_info
+
+
+# ---------------------------------------------------------------------------
+# build_presplit_dataloaders  (folder đã chia sẵn train/val/test)
+# ---------------------------------------------------------------------------
+# Cấu trúc folder mong đợi:
+#   root/
+#     train/  images/  masks/
+#     val/    images/  masks/
+#     test/   images/  masks/
+#
+# Mask có thể có hậu tố _mask (VD: foo_mask.png) hoặc tên giống ảnh (foo.png).
+# ---------------------------------------------------------------------------
+
+def build_presplit_dataloaders(
+    root: str,
+    image_size=(384, 384),
+    batch_size: int = 8,
+    num_workers: int = 4,
+    train_augmentation: bool = True,
+    small_polyp_sampling_power: float = 0.0,
+    train_subdir: str = "train",
+    val_subdir: str = "val",
+    test_subdir: str = "test",
+):
+    """
+    Tạo DataLoader từ folder đã chia sẵn train/val/test.
+
+    Args:
+        root: Đường dẫn đến folder gốc (vd: "processed_ebhi").
+        image_size: Kích thước ảnh (H, W) hoặc int.
+        batch_size: Số ảnh mỗi batch.
+        num_workers: Số worker cho DataLoader.
+        train_augmentation: Bật augmentation cho tập train.
+        small_polyp_sampling_power: > 0 để oversample polyp nhỏ ở train.
+        train_subdir / val_subdir / test_subdir: Tên subfolder.
+
+    Returns:
+        train_loader, val_loader, test_loader, meta_info
+    """
+    splits = {
+        "train": (train_subdir, train_augmentation),
+        "val":   (val_subdir,   False),
+        "test":  (test_subdir,  False),
+    }
+
+    loaders = {}
+    counts  = {}
+
+    pin_memory         = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
+
+    for split_name, (subdir, augment) in splits.items():
+        image_dir = os.path.join(root, subdir, "images")
+        mask_dir  = os.path.join(root, subdir, "masks")
+
+        file_names, mask_map = _validate_pairs(image_dir, mask_dir)
+
+        # Weighted sampler chỉ dùng cho train
+        sampler = None
+        if split_name == "train" and small_polyp_sampling_power > 0:
+            ratio_dict = _build_ratio_dict(mask_dir, file_names, mask_map)
+            sampler = _build_small_polyp_sampler(
+                file_names=file_names,
+                ratio_dict=ratio_dict,
+                sampling_power=small_polyp_sampling_power,
+            )
+
+        dataset = CleanPolypDataset(
+            image_dir=image_dir,
+            mask_dir=mask_dir,
+            file_names=file_names,
+            mask_map=mask_map,
+            image_size=image_size,
+            augment=augment,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(split_name == "train" and sampler is None),
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+
+        loaders[split_name] = loader
+        counts[split_name]  = len(dataset)
+
+    meta_info = {
+        "root": root,
+        "num_train": counts["train"],
+        "num_val":   counts["val"],
+        "num_test":  counts["test"],
+        "image_size": list(_normalize_image_size(image_size)),
+        "train_augmentation": train_augmentation,
+        "small_polyp_sampling_power": float(small_polyp_sampling_power),
+    }
+
+    return loaders["train"], loaders["val"], loaders["test"], meta_info
