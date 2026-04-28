@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python train.py --help)",
       "Bash(python *)",
-      "Bash(pip list *)"
+      "Bash(pip list *)",
+      "Bash(pip install *)"
     ]
   }
 }
