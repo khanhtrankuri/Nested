@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python train.py --help)",
+      "Bash(python *)",
+      "Bash(pip list *)"
+    ]
+  }
+}

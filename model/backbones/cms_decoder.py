@@ -777,7 +777,14 @@ class CMSDecoder(nn.Module):
         # aux_feat = s5 from BiFPN (for auxiliary head)
         aux_feat = s5
 
-        return fused, aux_feat, decoder_info
+        # Package results as dict for flexibility
+        result = {
+            'fused': fused,
+            'aux_feat': aux_feat,
+            'smoothed_features': [s2, s3, s4, s5],  # at native resolutions
+            'decoder_info': decoder_info
+        }
+        return result
 
     @torch.no_grad()
     def update_prototypes(self, decoder_info: Dict) -> None:
@@ -832,15 +839,27 @@ def _smoke_test():
         num_heads=4,
     ).to(device)
 
-    fused, aux, info = decoder(features)
+    result = decoder(features)
+    fused = result['fused']
+    aux = result['aux_feat']
+    info = result['decoder_info']
     assert fused.shape == (B, 128, H // 4, H // 4), f"fused shape: {fused.shape}"
-    assert aux.shape == (B, 512, H // 32, H // 32), f"aux shape: {aux.shape}"
+    assert aux.shape == (B, 128, H // 32, H // 32), f"aux shape: {aux.shape}"  # aux = s5 after BiFPN smoothing (128-ch)
     assert "uncertainty_map" in info
     assert info["uncertainty_map"].shape == (B, 1, H // 4, H // 4)
     assert "cms_gate_values" in info
     assert len(info["cms_gate_values"]) == 4
+    # Check smoothed_features exist
+    assert "smoothed_features" in result
+    smoothed = result["smoothed_features"]
+    assert len(smoothed) == 4
+    assert smoothed[0].shape == (B, 128, H // 4, H // 4)  # s2
+    assert smoothed[1].shape == (B, 128, H // 8, H // 8)  # s3
+    assert smoothed[2].shape == (B, 128, H // 16, H // 16)  # s4
+    assert smoothed[3].shape == (B, 128, H // 32, H // 32)  # s5
     print(f"   fused: {fused.shape}, aux: {aux.shape}")
     print(f"   uncertainty_map: {info['uncertainty_map'].shape}")
+    print(f"   smoothed_features: s2={tuple(smoothed[0].shape)}, s3={tuple(smoothed[1].shape)}")
     print(f"   CMS gates: { {k: f'{v.item():.4f}' for k, v in info['cms_gate_values'].items()} }")
     print("   PASS")
 
@@ -877,7 +896,10 @@ def _smoke_test():
         c3_eval = torch.randn(1, 128, H // 8, H // 8, device=device)
         c4_eval = torch.randn(1, 320, H // 16, H // 16, device=device)
         c5_eval = torch.randn(1, 512, H // 32, H // 32, device=device)
-        fused_eval, aux_eval, info_eval = decoder([c2_eval, c3_eval, c4_eval, c5_eval])
+        result_eval = decoder([c2_eval, c3_eval, c4_eval, c5_eval])
+        fused_eval = result_eval['fused']
+        aux_eval = result_eval['aux_feat']
+        info_eval = result_eval['decoder_info']
     assert fused_eval.shape == (1, 128, H // 4, H // 4)
     print(f"   fused: {fused_eval.shape}")
     print("   PASS")
@@ -897,7 +919,10 @@ def _smoke_test():
     c4_p = torch.randn(B, 320, H // 16, H // 16, device=device, requires_grad=True)
     c5_p = torch.randn(B, 512, H // 32, H // 32, device=device, requires_grad=True)
 
-    fused_p, aux_p, info_p = decoder_plain([c2_p, c3_p, c4_p, c5_p])
+    result_p = decoder_plain([c2_p, c3_p, c4_p, c5_p])
+    fused_p = result_p['fused']
+    aux_p = result_p['aux_feat']
+    info_p = result_p['decoder_info']
     assert fused_p.shape == (B, 128, H // 4, H // 4)
     assert len(info_p["cms_gate_values"]) == 0
     assert info_p["proto_cache"] is None

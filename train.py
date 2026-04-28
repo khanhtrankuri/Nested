@@ -73,6 +73,8 @@ class NestedPolypModel(nn.Module):
         dropout: float = 0.1,
         # CMS Self-Modifying Encoder params
         encoder_variant: str = "cms",  # "cms" | "minimal"
+        use_cross_stage: bool = False,
+        cross_attn_heads: int = 4,
         stage_configs: Optional[List[Dict]] = None,
         backbone_lr_decay: float = 0.5,
         unfreeze_schedule: Optional[Dict[str, int]] = None,
@@ -86,6 +88,11 @@ class NestedPolypModel(nn.Module):
         prototype_dim: int = 128,
         fast_momentum: float = 0.03,
         slow_momentum: float = 0.0075,
+        # Multi-Scale Segmentation Heads
+        enable_multi_scale: bool = False,
+        multi_scale_head_mode: str = "separate",
+        multi_scale_fusion: str = "weighted_sum",
+        multi_scale_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.encoder_name = encoder_name
@@ -118,6 +125,26 @@ class NestedPolypModel(nn.Module):
         self.unfreeze_schedule = dict(unfreeze_schedule)
         self.backbone_lr_decay = float(backbone_lr_decay)
 
+        # Cross-stage configuration
+        self.use_cross_stage = use_cross_stage
+        self.cross_attn_heads = cross_attn_heads
+
+        # Validation: cross-stage only supported for CMS encoder
+        if use_cross_stage and encoder_variant != "cms":
+            raise ValueError(
+                f"Cross-stage modulation is only supported for encoder_variant='cms', "
+                f"got '{encoder_variant}'. Set --use-cross-stage=False or use --encoder-variant cms."
+            )
+
+        # Prepare cross_modulator if needed (only for CMS encoder with cross-stage enabled)
+        cross_modulator = None
+        if self.use_cross_stage:
+            from model.advanced_modules import CrossStageModulator
+            cross_modulator = CrossStageModulator(
+                channels_list=self.backbone_channels,
+                num_heads=self.cross_attn_heads,
+            )
+
         if encoder_variant == "minimal":
             self.encoder = MinimalCMSEncoder(
                 backbone=backbone,
@@ -126,8 +153,8 @@ class NestedPolypModel(nn.Module):
                 backbone_lr_decay=self.backbone_lr_decay,
                 use_progressive_unfreeze=True,
                 unfreeze_schedule=self.unfreeze_schedule,
-                c3_adaptor_mode = "light", 
-                use_persistent_momentum = False,  # add learnable adaptor to c3 for better CMS performance (c2 is too low-level for effective adaptation)
+                c3_adaptor_mode="light",
+                use_persistent_momentum=False,
             )
         else:
             self.encoder = CMSSelfModifyingEncoder(
@@ -136,6 +163,8 @@ class NestedPolypModel(nn.Module):
                 stage_configs=self.stage_configs,
                 backbone_lr_decay=self.backbone_lr_decay,
                 unfreeze_schedule=self.unfreeze_schedule,
+                use_cross_stage=self.use_cross_stage,
+                cross_modulator=cross_modulator,
             )
 
         self.decoder = CMSDecoder(
@@ -150,6 +179,24 @@ class NestedPolypModel(nn.Module):
             memory_dim=memory_dim,
             gate_init_bias=gate_init_bias,
         )
+
+        # Multi-scale segmentation heads configuration
+        self.enable_multi_scale = enable_multi_scale
+        self.multi_scale_head_mode = multi_scale_head_mode
+        self.multi_scale_fusion = multi_scale_fusion
+        self.multi_scale_weights = list(multi_scale_weights) if multi_scale_weights else [0.1, 0.2, 0.3, 0.4]
+        assert len(self.multi_scale_weights) == 4, "multi_scale_weights must have 4 values"
+
+        # Initialize multi-scale heads if enabled
+        self.multi_scale_heads = None
+        if self.enable_multi_scale:
+            from model.multi_scale_heads import MultiScaleSegHeads
+            self.multi_scale_heads = MultiScaleSegHeads(
+                in_channels=decoder_channels,
+                num_scales=4,
+                mode=self.multi_scale_head_mode,
+                fusion_type=self.multi_scale_fusion,
+            )
 
         self.dropout = nn.Dropout2d(dropout)
         self.seg_head = nn.Sequential(
@@ -228,36 +275,62 @@ class NestedPolypModel(nn.Module):
         if len(features) != 4:
             raise RuntimeError(f"Expected 4 feature maps, got {len(features)}")
 
-        fused, aux_feat, decoder_info = self.decoder(features)
-        fused = self.dropout(fused)
-        logits = self.seg_head(fused)
-        aux_logits = self.aux_head(aux_feat)
+        # Decoder returns a dict with fused, aux_feat, smoothed_features, decoder_info
+        decoder_out = self.decoder(features)
+        fused = decoder_out['fused']
+        aux_feat = decoder_out['aux_feat']
+        decoder_info = decoder_out['decoder_info']
+        smoothed_features = decoder_out.get('smoothed_features')  # List of 4 tensors or None
 
-        logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
-        aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
+        # Apply dropout to fused features (used by seg_head)
+        fused = self.dropout(fused)
+
+        # Multi-scale heads OR single head
+        if self.enable_multi_scale and smoothed_features is not None:
+            # Use multi-scale segmentation heads
+            main_logits, scale_logits, scale_logits_upsampled = self.multi_scale_heads(
+                smoothed_features,
+                target_size=input_size
+            )
+            logits = main_logits
+        else:
+            # Standard single segmentation head on fused features
+            logits = self.seg_head(fused)
+            logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
+            scale_logits = None
+            scale_logits_upsampled = None
+
+        # Auxiliary head from c5-level feature (aux_feat)
+        if aux_feat is not None:
+            aux_logits = self.aux_head(aux_feat)
+            aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
+        else:
+            aux_logits = None
 
         nested_active = bool(use_nested and self.enable_nested)
         nested_info = self._build_nested_info(decoder_info, logits.device, logits.dtype)
         if not nested_active:
-            # Zero out nested_info when not active (engine meters still work)
             zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
             nested_info = {k: zero for k in nested_info}
 
-        # nested_cache: engine uses this to decide if prototype update is needed
-        # and passes it to update_nested_prototypes()
-        # Always return proto_cache so prototypes can pre-warm before
-        # nested_start_epoch, avoiding sudden distribution shift.
         proto_cache = decoder_info.get("proto_cache")
 
-        return {
+        outputs = {
             "logits": logits,
-            "coarse_logits": logits,  # same as logits (no separate coarse in v2)
+            "coarse_logits": logits,
             "aux_logits": aux_logits,
             "nested_info": nested_info,
             "nested_cache": proto_cache,
             "nl_info": nl_info,
             "decoder_info": decoder_info,
         }
+
+        # Add multi-scale outputs if enabled
+        if self.enable_multi_scale and scale_logits is not None:
+            outputs['multi_scale_logits'] = scale_logits
+            outputs['multi_scale_logits_upsampled'] = scale_logits_upsampled
+
+        return outputs
 
     @torch.no_grad()
     def update_nested_prototypes(
@@ -295,11 +368,13 @@ class NLLossWrapper(nn.Module):
         base_loss: nn.Module,
         surprise_weight: float = 0.05,
         diversity_weight: float = 0.01,
+        multi_scale_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.base = base_loss
         self.surprise_weight = float(surprise_weight)
         self.diversity_weight = float(diversity_weight)
+        self.multi_scale_weights = list(multi_scale_weights) if multi_scale_weights is not None else [0.1, 0.2, 0.3, 0.4]
 
     def _prototype_diversity_loss(self, outputs: Dict) -> torch.Tensor:
         """Penalize prototype collapse: encourage pairwise dissimilarity."""
@@ -361,6 +436,29 @@ class NLLossWrapper(nn.Module):
             total = total + self.diversity_weight * div_loss
         else:
             div_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+
+        # --- Multi-Scale auxiliary losses ---
+        if isinstance(outputs, dict) and "multi_scale_logits" in outputs:
+            scale_logits = outputs["multi_scale_logits"]
+            multi_scale_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+            for i, logits in enumerate(scale_logits):
+                B, C, H_scale, W_scale = logits.shape
+                # Downsample targets to match scale resolution
+                if H_scale < targets.shape[-2]:
+                    targets_scaled = F.interpolate(targets, size=(H_scale, W_scale), mode='nearest')
+                else:
+                    targets_scaled = targets
+                # Compute BCE + Dice loss (lightweight, same as auxiliary)
+                loss_bce_i = self.base.bce(logits, targets_scaled)
+                loss_dice_i = self.base.dice(logits, targets_scaled)
+                loss_i = 0.5 * loss_bce_i + 0.5 * loss_dice_i
+                weight = self.multi_scale_weights[i]
+                multi_scale_loss = multi_scale_loss + weight * loss_i
+                if return_components:
+                    components[f"loss_multi_scale_p{i+2}"] = float(loss_i.detach().item())
+            total = total + multi_scale_loss
+            if return_components:
+                components["loss_multi_scale_total"] = float(multi_scale_loss.detach().item())
 
         if return_components:
             components["loss_surprise"] = float(surprise_total.detach().item())
@@ -458,6 +556,22 @@ def build_parser():
     parser.add_argument("--fast-momentum", type=float, default=0.05)
     parser.add_argument("--slow-momentum", type=float, default=0.003)
     parser.add_argument("--diversity-weight", type=float, default=0.01)
+
+    # --- Multi-Scale Segmentation Heads ---
+    parser.add_argument("--multi-scale-heads", action="store_true",
+                        help="Enable segmentation heads at multiple FPN levels (p2,p3,p4,p5)")
+    parser.add_argument("--multi-scale-head-mode", choices=["separate", "shared"], default="separate",
+                        help="Separate: distinct head per scale; Shared: same head for all")
+    parser.add_argument("--multi-scale-weights", type=float, nargs=4, default=[0.1, 0.2, 0.3, 0.4],
+                        help="Loss weights for p2, p3, p4, p5 auxiliary heads")
+    parser.add_argument("--multi-scale-fusion", choices=["weighted_sum", "attention"], default="weighted_sum",
+                        help="How to fuse multi-scale logits for final output")
+
+    # --- Cross-Stage Modulation ---
+    parser.add_argument("--use-cross-stage", action="store_true",
+                        help="Enable cross-stage attention between encoder stages")
+    parser.add_argument("--cross-attn-heads", type=int, default=4,
+                        help="Number of attention heads for cross-stage modulation")
 
     # --- Engine-level nested control ---
     parser.add_argument(
@@ -752,6 +866,9 @@ def main():
         stage_configs=stage_configs,
         backbone_lr_decay=float(args.backbone_lr_decay),
         unfreeze_schedule=unfreeze_schedule,
+        # Cross-Stage Modulation
+        use_cross_stage=args.use_cross_stage,
+        cross_attn_heads=args.cross_attn_heads,
         # CMS Decoder
         enable_nested=args.enable_nested,
         cms_levels=list(args.cms_levels),
@@ -762,12 +879,18 @@ def main():
         prototype_dim=args.prototype_dim,
         fast_momentum=args.fast_momentum,
         slow_momentum=args.slow_momentum,
+        # Multi-Scale Segmentation Heads
+        enable_multi_scale=args.multi_scale_heads,
+        multi_scale_head_mode=args.multi_scale_head_mode,
+        multi_scale_fusion=args.multi_scale_fusion,
+        multi_scale_weights=args.multi_scale_weights,
     )
     model = NestedPolypModel(**model_kwargs).to(device)
     criterion = NLLossWrapper(
         StrongBaselineLoss(),
         surprise_weight=args.nl_surprise_weight,
         diversity_weight=args.diversity_weight,
+        multi_scale_weights=args.multi_scale_weights if args.multi_scale_heads else None,
     )
 
     if args.init_checkpoint:
