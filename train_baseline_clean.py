@@ -4,6 +4,7 @@ import json
 import os
 
 import torch
+import torch.nn as nn
 from torch.amp import GradScaler
 
 from data.load_data_clean import build_clean_dataloaders
@@ -11,6 +12,19 @@ from data.load_GlaS_dataset import build_glas_dataloaders
 from engine.train_eval_clean import ModelEMA, evaluate_clean, test_clean, threshold_sweep_clean, train_one_epoch_clean
 from loss.strong_baseline_loss import StrongBaselineLoss
 from model.backbones.strong_baseline import StrongBaselinePolypModel
+
+
+class AdvancedLossWrapper(nn.Module):
+    """Wrapper to use model.compute_loss as a criterion."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, outputs, targets, return_components=False):
+        total_loss, loss_dict = self.model.compute_loss(outputs, targets)
+        if return_components:
+            return total_loss, loss_dict
+        return total_loss
 
 
 def build_parser():
@@ -66,6 +80,41 @@ def build_parser():
     parser.set_defaults(stratified_split=True)
     parser.add_argument("--glas-val-ratio", type=float, default=0.0,
                         help="GlaS: fraction of train to hold out as val (0 = use testA as val)")
+
+    # Advanced features
+    parser.add_argument("--use-cross-stage-encoder", action="store_true",
+                        help="Enable cross-stage modulation in encoder")
+    parser.add_argument("--use-adaptive-cms", action="store_true",
+                        help="Enable adaptive inner loop parameters")
+    parser.add_argument("--adaptive-max-steps", type=int, default=8,
+                        help="Max inner steps for adaptive CMS")
+    parser.add_argument("--use-advanced-decoder", action="store_true",
+                        help="Use CMSDecoder instead of FPNDecoder + Refiner")
+    parser.add_argument("--use-hierarchical-prototypes", action="store_true",
+                        help="Use hierarchical prototype bank")
+    parser.add_argument("--hierarchical-levels", type=int, default=3,
+                        help="Number of hierarchy levels")
+    parser.add_argument("--prototypes-per-level", type=int, default=8,
+                        help="Prototypes per level (if hierarchical)")
+    parser.add_argument("--cms-levels", type=int, nargs="+", default=[0,1,2,3],
+                        help="FPN levels to apply CMS memory (0=p2, 1=p3, 2=p4, 3=p5)")
+    parser.add_argument("--use-mc-dropout", action="store_true",
+                        help="Enable MC dropout for uncertainty")
+    parser.add_argument("--mc-dropout-p", type=float, default=0.1,
+                        help="MC dropout probability")
+    parser.add_argument("--num-mc-samples", type=int, default=10,
+                        help="Number of MC samples at inference")
+    parser.add_argument("--use-enhanced-loss", action="store_true",
+                        help="Use enhanced loss with contrastive, consistency, sparsity, quality")
+    parser.add_argument("--prototype-contrastive-weight", type=float, default=0.05,
+                        help="Weight for prototype contrastive loss")
+    parser.add_argument("--inner-consistency-weight", type=float, default=0.02,
+                        help="Weight for inner loop consistency loss")
+    parser.add_argument("--gate-sparsity-weight", type=float, default=0.01,
+                        help="Weight for gate sparsity regularization")
+    parser.add_argument("--memory-quality-weight", type=float, default=0.02,
+                        help="Weight for memory quality regularization")
+
     return parser
 
 
@@ -133,6 +182,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    pretrained_cache_dir = args.pretrained_cache_dir
+
     # --- Build dataloaders ---
     test_loaders = {}
     if args.dataset == "glas":
@@ -163,25 +214,77 @@ def main():
         )
         test_loaders["test"] = test_loader
 
-    pretrained_cache_dir = args.pretrained_cache_dir.strip() or os.path.join(args.save_root, ".torch_cache")
-    model = StrongBaselinePolypModel(
-        encoder_name=args.encoder_name,
-        use_pretrained=args.use_pretrained,
-        strict_pretrained=args.strict_pretrained,
-        pretrained_cache_dir=pretrained_cache_dir,
-        img_size=args.image_size[0],
-        decoder_channels=args.decoder_channels,
-        dropout=args.dropout,
-        enable_nested=args.enable_nested,
-        nested_dim=args.nested_dim,
-        nested_prototypes=args.nested_prototypes,
-        nested_residual_scale=args.nested_residual_scale,
-        nested_max_norm=args.nested_max_norm,
-        nested_memory_mode=args.nested_memory_mode,
-        nested_memory_hidden=args.nested_memory_hidden,
-        nested_slow_momentum_scale=args.nested_slow_momentum_scale,
-    ).to(device)
-    criterion = StrongBaselineLoss()
+    # Determine if we should use advanced model
+    use_advanced = any([
+        args.use_cross_stage_encoder,
+        args.use_adaptive_cms,
+        args.use_hierarchical_prototypes,
+        args.use_mc_dropout,
+        args.use_enhanced_loss,
+    ])
+
+    if use_advanced:
+        from model.advanced_polymemnet import AdvancedPolyMemnet
+        model = AdvancedPolyMemnet(
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=args.decoder_channels,
+            dropout=args.dropout,
+            encoder_name=args.encoder_name,
+            use_pretrained=args.use_pretrained,
+            strict_pretrained=args.strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+            img_size=args.image_size[0],
+            enable_nested=args.enable_nested,
+            nested_dim=args.nested_dim,
+            nested_prototypes=args.nested_prototypes,
+            nested_residual_scale=args.nested_residual_scale,
+            nested_max_norm=args.nested_max_norm,
+            nested_memory_mode=args.nested_memory_mode,
+            nested_memory_hidden=args.nested_memory_hidden,
+            nested_slow_momentum_scale=args.nested_slow_momentum_scale,
+            # Advanced features
+            use_cross_stage_encoder=args.use_cross_stage_encoder,
+            use_adaptive_cms=args.use_adaptive_cms,
+            adaptive_max_steps=args.adaptive_max_steps,
+            use_hierarchical_prototypes=args.use_hierarchical_prototypes,
+            hierarchical_levels=args.hierarchical_levels,
+            prototypes_per_level=args.prototypes_per_level,
+            cms_levels=args.cms_levels,
+            use_mc_dropout=args.use_mc_dropout,
+            mc_dropout_p=args.mc_dropout_p,
+            num_mc_samples=args.num_mc_samples,
+            use_enhanced_loss=args.use_enhanced_loss,
+            prototype_contrastive_weight=args.prototype_contrastive_weight,
+            inner_consistency_weight=args.inner_consistency_weight,
+            gate_sparsity_weight=args.gate_sparsity_weight,
+            memory_quality_weight=args.memory_quality_weight,
+        ).to(device)
+        # Loss will be handled by model.compute_loss if enhanced, else wrapper
+        if args.use_enhanced_loss:
+            criterion = AdvancedLossWrapper(model)
+        else:
+            criterion = StrongBaselineLoss()
+    else:
+        model = StrongBaselinePolypModel(
+            encoder_name=args.encoder_name,
+            use_pretrained=args.use_pretrained,
+            strict_pretrained=args.strict_pretrained,
+            pretrained_cache_dir=pretrained_cache_dir,
+            img_size=args.image_size[0],
+            decoder_channels=args.decoder_channels,
+            dropout=args.dropout,
+            enable_nested=args.enable_nested,
+            nested_dim=args.nested_dim,
+            nested_prototypes=args.nested_prototypes,
+            nested_residual_scale=args.nested_residual_scale,
+            nested_max_norm=args.nested_max_norm,
+            nested_memory_mode=args.nested_memory_mode,
+            nested_memory_hidden=args.nested_memory_hidden,
+            nested_slow_momentum_scale=args.nested_slow_momentum_scale,
+        ).to(device)
+        criterion = StrongBaselineLoss()
+
     model_kwargs = {
         "encoder_name": args.encoder_name,
         "use_pretrained": args.use_pretrained,
@@ -197,6 +300,14 @@ def main():
         "nested_memory_mode": args.nested_memory_mode,
         "nested_memory_hidden": args.nested_memory_hidden,
         "nested_slow_momentum_scale": args.nested_slow_momentum_scale,
+        # Advanced flags
+        "use_cross_stage_encoder": args.use_cross_stage_encoder,
+        "use_adaptive_cms": args.use_adaptive_cms,
+        "use_hierarchical_prototypes": args.use_hierarchical_prototypes,
+        "use_mc_dropout": args.use_mc_dropout,
+        "use_enhanced_loss": args.use_enhanced_loss,
+        # Computed flag for bookkeeping
+        "use_advanced_decoder": use_advanced and (args.use_hierarchical_prototypes or args.use_cross_stage_encoder),
     }
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location=device)

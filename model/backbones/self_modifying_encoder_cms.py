@@ -43,11 +43,22 @@ Các thay đổi chính so với bản cũ:
    - 'consistency' : chỉ penalize BN/GroupNorm running-stat drift (nhẹ, cheap)
    - 'full'        : masked reconstruction + consistency (cũ)
 
+6. CROSS-STAGE MODULATION (NEW)
+   - Cho phép các stage giao tiếp với nhau qua cross-attention
+   - Mỗi stage có thể attend vào các stage khác (shallow details, deep semantics)
+   - Có thể tắt qua use_cross_stage=False
+
+7. ADAPTIVE CMS (NEW)
+   - Inner loop parameters (steps, lr, threshold) được dự đoán từ input
+   - Dynamic resource allocation dựa trên surprise magnitude
+   - Enabled qua stage_config['adaptive'] = True
+
 Tương thích ngược:
 - Interface forward(x, return_nested_info=True) giữ nguyên
 - nested_info dict có cùng keys như bản cũ để NLLossWrapper không vỡ
 
 Author: viethung-pka (PolyMemnet v2.5, CMS-aware encoder)
+Enhanced by: Claude Code (2026-04-28)
 """
 
 import math
@@ -450,6 +461,8 @@ class CMSSelfModifyingEncoder(nn.Module):
                                     từ epoch 8 unfreeze c3;
                                     từ epoch 16 unfreeze c2 + stem.
                           Set tất cả = 0 để disable progressive (unfreeze ngay).
+        use_cross_stage: bool, có dùng cross-stage modulation không
+        cross_modulator: CrossStageModulator instance (tự tạo nếu None và use_cross_stage=True)
     """
 
     def __init__(
@@ -459,6 +472,8 @@ class CMSSelfModifyingEncoder(nn.Module):
         stage_configs: Optional[List[Dict[str, Any]]] = None,
         backbone_lr_decay: float = 0.5,
         unfreeze_schedule: Optional[Dict[str, int]] = None,
+        use_cross_stage: bool = False,
+        cross_modulator: Optional[Any] = None,  # Forward reference
     ):
         super().__init__()
         assert len(feature_channels) == 4, "Expect 4 feature channels (c2..c5)"
@@ -476,6 +491,21 @@ class CMSSelfModifyingEncoder(nn.Module):
             unfreeze_schedule = {"deep": 0, "mid": 8, "shallow": 16}
         self.unfreeze_schedule = dict(unfreeze_schedule)
         self._current_epoch = 0
+
+        # Cross-stage modulation (NEW)
+        self.use_cross_stage = bool(use_cross_stage)
+        if self.use_cross_stage:
+            if cross_modulator is not None:
+                self.cross_modulator = cross_modulator
+            else:
+                # Lazy import to avoid circular dependency
+                from model.advanced_modules import CrossStageModulator
+                self.cross_modulator = CrossStageModulator(
+                    channels_list=feature_channels,
+                    num_heads=4,
+                )
+        else:
+            self.cross_modulator = None
 
         # Tạo adaptor/modifier per-stage theo config
         self.stage_modules = nn.ModuleDict()
@@ -499,11 +529,11 @@ class CMSSelfModifyingEncoder(nn.Module):
             elif mode == "full":
                 self.stage_modules[key] = CMSSelfModifyingBlock(
                     channels=ch,
-                    inner_steps=int(cfg.get("inner_steps", 5)),
+                    inner_steps=int(cfg.get("inner_steps", 2)),
                     inner_lr=float(cfg.get("inner_lr", 5e-3)),
                     inner_momentum=float(cfg.get("inner_momentum", 0.9)),
                     modifier_expansion=int(cfg.get("modifier_expansion", 2)),
-                    dropout=float(cfg.get("dropout", 0.2)),
+                    dropout=float(cfg.get("dropout", 0.1)),
                     surprise_type=str(cfg.get("surprise_type", "full")),
                     persist_momentum=bool(cfg.get("persist_momentum", True)),
                     residual_init=float(cfg.get("residual_init", 0.05)),
@@ -628,13 +658,19 @@ class CMSSelfModifyingEncoder(nn.Module):
         for key, module in self.stage_modules.items():
             outer_params: List[nn.Parameter] = []
             inner_params: List[nn.Parameter] = []
+            meta_opt_params: List[nn.Parameter] = []
+
             for pname, p in module.named_parameters():
+                # Check for AdaptiveCMSSelfModifyingBlock (has meta_optimizers)
+                if hasattr(module, "meta_optimizers") and "meta_optimizers" in pname:
+                    meta_opt_params.append(p)
                 # Inner loop target = self.modifier.* (trong CMSSelfModifyingBlock)
                 # → LR nhỏ hơn vì đã được inner SGD update rồi
-                if isinstance(module, CMSSelfModifyingBlock) and pname.startswith("modifier."):
+                elif isinstance(module, CMSSelfModifyingBlock) and pname.startswith("modifier."):
                     inner_params.append(p)
                 else:
                     outer_params.append(p)
+
             if outer_params:
                 groups.append({
                     "params": outer_params,
@@ -648,6 +684,13 @@ class CMSSelfModifyingEncoder(nn.Module):
                     "lr": adaptor_lr * modifier_inner_lr_scale,
                     "weight_decay": weight_decay * 0.1,  # nhẹ hơn cho inner
                     "name": f"modifier_inner_{key}",
+                })
+            if meta_opt_params:
+                groups.append({
+                    "params": meta_opt_params,
+                    "lr": adaptor_lr * 0.5,  # moderate LR for meta-optimizer
+                    "weight_decay": 0.0,
+                    "name": f"meta_optimizer_{key}",
                 })
 
         # --- Pre-norms ---
@@ -677,6 +720,15 @@ class CMSSelfModifyingEncoder(nn.Module):
             raise RuntimeError(f"Expected 4 feature maps, got {len(features)}")
 
         nested_info: Dict[str, Dict] = {}
+
+        # Cross-stage modulation (BEFORE per-stage modification)
+        if self.use_cross_stage and self.cross_modulator is not None:
+            cross_out = self.cross_modulator(features, return_routing=return_nested_info)
+            if return_nested_info and isinstance(cross_out, tuple):
+                features, routing_info = cross_out
+                nested_info["cross_stage"] = routing_info
+            else:
+                features = cross_out
 
         for idx, mode in enumerate(self.stage_modes):
             if mode == "none":

@@ -21,7 +21,7 @@ Knowledge Transfer:
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -553,6 +553,9 @@ class CMSDecoder(nn.Module):
         cms_levels: which FPN levels get CMS memory ([] to disable)
         memory_dim: dimension for CMS linear attention
         gate_init_bias: initial gate bias for CMS modules
+        use_hierarchical_prototypes: bool, use hierarchical tree-structured prototypes
+        hierarchical_levels: number of hierarchy levels (if use_hierarchical=True)
+        prototypes_per_level: prototypes per level (int or list)
     """
 
     def __init__(
@@ -567,6 +570,9 @@ class CMSDecoder(nn.Module):
         cms_levels: List[int] = [0, 1, 2, 3],
         memory_dim: int = 64,
         gate_init_bias: float = -2.0,
+        use_hierarchical_prototypes: bool = False,
+        hierarchical_levels: int = 3,
+        prototypes_per_level: Union[int, List[int]] = 8,
     ):
         super().__init__()
         self.fpn_channels = fpn_channels
@@ -618,14 +624,25 @@ class CMSDecoder(nn.Module):
 
         # --- Prototype Memory Bank ---
         self.prototype = None
+        self.use_hierarchical_prototypes = use_hierarchical_prototypes
         if num_prototypes > 0:
-            self.prototype = PrototypeMemoryBank(
-                feature_dim=fpn_channels,
-                prototype_dim=prototype_dim,
-                num_prototypes=num_prototypes,
-                fast_momentum=fast_momentum,
-                slow_momentum=slow_momentum,
-            )
+            if use_hierarchical_prototypes:
+                from model.advanced_modules import HierarchicalPrototypeBank
+                self.prototype = HierarchicalPrototypeBank(
+                    feature_dim=fpn_channels,
+                    num_levels=hierarchical_levels,
+                    prototypes_per_level=prototypes_per_level,
+                    fast_momentum=fast_momentum,
+                    slow_momentum=slow_momentum,
+                )
+            else:
+                self.prototype = PrototypeMemoryBank(
+                    feature_dim=fpn_channels,
+                    prototype_dim=prototype_dim,
+                    num_prototypes=num_prototypes,
+                    fast_momentum=fast_momentum,
+                    slow_momentum=slow_momentum,
+                )
 
         # --- Uncertainty-Aware Fusion ---
         self.uncertainty_fusion = None
@@ -721,11 +738,25 @@ class CMSDecoder(nn.Module):
 
         if self.prototype is not None and self.uncertainty_fusion is not None:
             proto_out = self.prototype(fused)
-            proto_cache = {
-                "token": proto_out["token"],
-                "attn_fast": proto_out["attn_fast"],
-                "attn_slow": proto_out["attn_slow"],
-            }
+            if self.use_hierarchical_prototypes:
+                # Hierarchical bank returns per-level attention
+                proto_cache = {
+                    "token": proto_out["token"],
+                    "attn_per_level": proto_out["attn_per_level"],
+                    "level_weights": proto_out["level_weights"],
+                    "level_mix": proto_out["level_mix"],
+                }
+                decoder_info["prototype_level_weights"] = proto_out["level_weights"].detach()
+            else:
+                # Standard dual-speed bank
+                proto_cache = {
+                    "token": proto_out["token"],
+                    "attn_fast": proto_out["attn_fast"],
+                    "attn_slow": proto_out["attn_slow"],
+                }
+                decoder_info["prototype_mix"] = proto_out["mix"].mean()
+                decoder_info["prototype_sim_fast"] = proto_out["attn_fast"]
+                decoder_info["prototype_sim_slow"] = proto_out["attn_slow"]
 
             # Uncertainty-gated augmentation
             fused, unc_map = self.uncertainty_fusion(
@@ -735,9 +766,6 @@ class CMSDecoder(nn.Module):
             )
 
             decoder_info["uncertainty_map"] = unc_map.detach()
-            decoder_info["prototype_mix"] = proto_out["mix"].mean()
-            decoder_info["prototype_sim_fast"] = proto_out["attn_fast"]
-            decoder_info["prototype_sim_slow"] = proto_out["attn_slow"]
         else:
             decoder_info["uncertainty_map"] = torch.zeros(
                 fused.size(0), 1, *fused.shape[-2:],
@@ -746,8 +774,8 @@ class CMSDecoder(nn.Module):
 
         decoder_info["proto_cache"] = proto_cache
 
-        # aux_feat = raw c5 from encoder (for auxiliary head)
-        aux_feat = c5
+        # aux_feat = s5 from BiFPN (for auxiliary head)
+        aux_feat = s5
 
         return fused, aux_feat, decoder_info
 
