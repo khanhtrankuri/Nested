@@ -209,6 +209,8 @@ class NestedPolypModel(nn.Module):
             ConvBNAct(decoder_channels, decoder_channels // 2),
             nn.Conv2d(decoder_channels // 2, 1, 1),
         )
+        # Store for debugging
+        self._decoder_channels = decoder_channels
 
     def _build_nested_info(
         self, decoder_info: Dict, device: torch.device, dtype: torch.dtype,
@@ -302,9 +304,6 @@ class NestedPolypModel(nn.Module):
 
         # Auxiliary head from c5-level feature (aux_feat)
         if aux_feat is not None:
-            # DEBUG
-            import sys
-            print(f"[DEBUG] aux_feat.shape = {aux_feat.shape}, aux_head input channels expected: {decoder_channels}", file=sys.stderr)
             aux_logits = self.aux_head(aux_feat)
             aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
         else:
