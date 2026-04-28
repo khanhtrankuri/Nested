@@ -209,9 +209,6 @@ class NestedPolypModel(nn.Module):
             ConvBNAct(decoder_channels, decoder_channels // 2),
             nn.Conv2d(decoder_channels // 2, 1, 1),
         )
-        # DEBUG: print aux_head architecture
-        import sys
-        print(f"[DEBUG NestedPolypModel] decoder_channels={decoder_channels}, aux_head[0].conv.in_channels={self.aux_head[0].conv.in_channels}", file=sys.stderr)
 
     def _build_nested_info(
         self, decoder_info: Dict, device: torch.device, dtype: torch.dtype,
