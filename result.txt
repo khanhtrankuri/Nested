@@ -9,6 +9,16 @@ Best validation Dice: 0.9431
 Best threshold: 0.65
 Best nested active: True
 Final test nested active: True
+---------> 0.7/0.15/0.15  <----------
+Early stopping at epoch 50 (patience=15).
+[Eval][Epoch 0] Step 8/8 | loss=0.2091 | dice=0.9413 | iou=0.8920
+[test] IoU: 0.8920 | Dice: 0.9413
+
+Best validation IoU: 0.8978
+Best validation Dice: 0.9444
+Best threshold: 0.50
+Best nested active: True
+Final test nested active: True
 ```
 <============>
 ```
@@ -22,13 +32,23 @@ Best validation Dice: 0.9446
 Best threshold: 0.65
 Best nested active: True
 Final test nested active: True
+---------> 0.7/0.15/0.15  <----------
+Early stopping at epoch 41 (patience=15).
+[Eval][Epoch 0] Step 8/8 | loss=0.1974 | dice=0.9449 | iou=0.8978
+[test] IoU: 0.8978 | Dice: 0.9449
+
+Best validation IoU: 0.8954
+Best validation Dice: 0.9430
+Best threshold: 0.65
+Best nested active: True
+Final test nested active: True
 ```
 
 ====================================================================================================
 
 # using --small-polyp-sampling-power 0.5
 ```
-CUDA_VISIBLE_DEVICES=3 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant cms --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion attention --use-cross-stage --image-size 256 256 --patience 15 --small-polyp-sampling-power 0.5
+CUDA_VISIBLE_DEVICES=5 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant cms --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion attention --use-cross-stage --image-size 256 256 --patience 15 --small-polyp-sampling-power 0.5
 
 Early stopping at epoch 57 (patience=15).
 [Eval][Epoch 0] Step 5/5 | loss=0.2102 | dice=0.9444 | iou=0.8975
@@ -37,6 +57,16 @@ Early stopping at epoch 57 (patience=15).
 Best validation IoU: 0.8958
 Best validation Dice: 0.9437
 Best threshold: 0.60
+Best nested active: True
+Final test nested active: True
+---------> 0.7/0.15/0.15  <----------
+Early stopping at epoch 41 (patience=15).
+[Eval][Epoch 0] Step 8/8 | loss=0.1974 | dice=0.9449 | iou=0.8978
+[test] IoU: 0.8978 | Dice: 0.9449
+
+Best validation IoU: 0.8954
+Best validation Dice: 0.9430
+Best threshold: 0.65
 Best nested active: True
 Final test nested active: True
 ```
@@ -50,6 +80,18 @@ Early stopping at epoch 52 (patience=15).
 
 Best validation IoU: 0.8942
 Best validation Dice: 0.9430
+Best threshold: 0.40
+Best nested active: True
+Final test nested active: True
+
+
+---------> 0.7/0.15/0.15  <----------
+Early stopping at epoch 51 (patience=15).
+[Eval][Epoch 0] Step 8/8 | loss=0.1574 | dice=0.9434 | iou=0.8953
+[test] IoU: 0.8953 | Dice: 0.9434
+
+Best validation IoU: 0.8971
+Best validation Dice: 0.9437
 Best threshold: 0.40
 Best nested active: True
 Final test nested active: True
@@ -68,4 +110,38 @@ Best validation Dice: 0.9414
 Best threshold: 0.60
 Best nested active: False
 Final test nested active: False
+---------> 0.7/0.15/0.15  <----------
+
 ```
+
+```
+CUDA_VISIBLE_DEVICES=1 python train.py     --dataset kvasir --file-path datasets/Adenocarcinoma     --batch-size 4 --epochs 300     --encoder-name swinv2_large --use-pretrained     --encoder-variant cms --nl-stage-config-preset aggressive     --enable-nested --nested-start-epoch 10 --boundary-loss-type soft_dice --boundary-weight 0.15     --diversity-weight 0.015     --multi-scale-heads --multi-scale-head-mode separate     --multi-scale-fusion attention --use-cross-stage     --cross-attn-heads 8     --image-size 384 384 --patience 15     --num-prototypes 12 --prototype-dim 192     --memory-dim 192 --num-heads 12     --cms-levels 0 1 2 3     --fast-momentum 0.06 --slow-momentum 0.008     --lr 1.5e-4 --encoder-lr 6e-5 --decoder-lr 1.5e-4     --weight-decay 8e-5     --save-root outputs/kvasir_swinv2_final_opt
+```
+
+```
+CUDA_VISIBLE_DEVICES=3 python train.py     --dataset kvasir --file-path datasets/Adenocarcinoma     --batch-size 4 --epochs 300     --encoder-name swinv2_large --use-pretrained     --encoder-variant cms --nl-stage-config-preset aggressive     --enable-nested --nested-start-epoch 10 --boundary-loss-type focal --boundary-weight 0.15     --diversity-weight 0.015     --multi-scale-heads --multi-scale-head-mode separate     --multi-scale-fusion attention --use-cross-stage     --cross-attn-heads 8     --image-size 384 384 --patience 15     --num-prototypes 12 --prototype-dim 192     --memory-dim 192 --num-heads 12     --cms-levels 0 1 2 3     --fast-momentum 0.06 --slow-momentum 0.008     --lr 1.5e-4 --encoder-lr 6e-5 --decoder-lr 1.5e-4     --weight-decay 8e-5     --save-root outputs/kvasir_swinv2_final_opt
+```
+
+```
+CUDA_VISIBLE_DEVICES=2 python train.py     --dataset kvasir --file-path datasets/Adenocarcinoma     --batch-size 2 --epochs 300     --encoder-name swinv2_large --use-pretrained     --encoder-variant cms --nl-stage-config-preset aggressive     --enable-nested --nested-start-epoch 10 --boundary-loss-type combined --boundary-weight 0.15     --diversity-weight 0.015     --multi-scale-heads --multi-scale-head-mode separate     --multi-scale-fusion attention --use-cross-stage     --cross-attn-heads 8     --image-size 384 384 --patience 15     --num-prototypes 12 --prototype-dim 192     --memory-dim 192 --num-heads 12     --cms-levels 0 1 2 3     --fast-momentum 0.06 --slow-momentum 0.008     --lr 1.5e-4 --encoder-lr 6e-5 --decoder-lr 1.5e-4     --weight-decay 8e-5     --save-root outputs/kvasir_swinv2_final_opt
+```
+
+CUDA_VISIBLE_DEVICES=2 python train.py \
+    --dataset kvasir --file-path datasets/Adenocarcinoma \
+    --batch-size 4 --epochs 300 \
+    --encoder-name pvtv2_b5 --use-pretrained \
+    --encoder-variant cms --nl-stage-config-preset aggressive \
+    --enable-nested --nested-start-epoch 10 \
+    --boundary-loss-type combined --boundary-weight 0.15 \
+    --diversity-weight 0.015 \
+    --multi-scale-heads --multi-scale-head-mode separate \
+    --multi-scale-fusion attention --use-cross-stage \
+    --cross-attn-heads 8 \
+    --image-size 384 384 --patience 15 \
+    --num-prototypes 12 --prototype-dim 192 \
+    --memory-dim 192 --num-heads 12 \
+    --cms-levels 0 1 2 3 \
+    --fast-momentum 0.06 --slow-momentum 0.008 \
+    --lr 1.5e-4 --encoder-lr 6e-5 --decoder-lr 1.5e-4 \
+    --weight-decay 8e-5 \
+    --save-root outputs/kvasir_pvtv2b5_384_opt
