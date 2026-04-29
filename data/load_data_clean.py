@@ -163,9 +163,9 @@ def _split_with_optional_stratify(
 def build_strict_split(
     file_names: Sequence[str],
     seed: int = 42,
-    train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
-    test_ratio: float = 0.1,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
     ratio_dict: Optional[Dict[str, float]] = None,
 ) -> SplitInfo:
     if not math.isclose(train_ratio + val_ratio + test_ratio, 1.0, rel_tol=1e-6):

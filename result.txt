@@ -1,0 +1,71 @@
+```
+CUDA_VISIBLE_DEVICES=3 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant cms --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion attention --use-cross-stage --image-size 256 256 --patience 15 
+Early stopping at epoch 55 (patience=15).
+[Eval][Epoch 0] Step 5/5 | loss=0.1973 | dice=0.9478 | iou=0.9026
+[test] IoU: 0.9026 | Dice: 0.9478
+
+Best validation IoU: 0.8946
+Best validation Dice: 0.9431
+Best threshold: 0.65
+Best nested active: True
+Final test nested active: True
+```
+<============>
+```
+CUDA_VISIBLE_DEVICES=1 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant cms --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion weighted_sum --use-cross-stage --image-size 256 256 --patience 15 
+Early stopping at epoch 45 (patience=15).
+[Eval][Epoch 0] Step 5/5 | loss=0.1952 | dice=0.9476 | iou=0.9023
+[test] IoU: 0.9023 | Dice: 0.9476
+
+Best validation IoU: 0.8970
+Best validation Dice: 0.9446
+Best threshold: 0.65
+Best nested active: True
+Final test nested active: True
+```
+
+====================================================================================================
+
+# using --small-polyp-sampling-power 0.5
+```
+CUDA_VISIBLE_DEVICES=3 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant cms --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion attention --use-cross-stage --image-size 256 256 --patience 15 --small-polyp-sampling-power 0.5
+
+Early stopping at epoch 57 (patience=15).
+[Eval][Epoch 0] Step 5/5 | loss=0.2102 | dice=0.9444 | iou=0.8975
+[test] IoU: 0.8975 | Dice: 0.9444
+
+Best validation IoU: 0.8958
+Best validation Dice: 0.9437
+Best threshold: 0.60
+Best nested active: True
+Final test nested active: True
+```
+<============>
+```
+CUDA_VISIBLE_DEVICES=4 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant minimal --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type focal --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion weighted_sum --image-size 256 256 --patience 15 --small-polyp-sampling-power 0.5
+
+Early stopping at epoch 52 (patience=15).
+[Eval][Epoch 0] Step 5/5 | loss=0.1576 | dice=0.9468 | iou=0.9015
+[test] IoU: 0.9015 | Dice: 0.9468
+
+Best validation IoU: 0.8942
+Best validation Dice: 0.9430
+Best threshold: 0.40
+Best nested active: True
+Final test nested active: True
+
+```
+<============>
+```
+CUDA_VISIBLE_DEVICES=5 python train.py --dataset kvasir --file-path datasets/Adenocarcinoma --batch-size 16 --epochs 200 --encoder-name swinv2_large --use-pretrain --encoder-variant minimal --nl-stage-config-preset aggressive --enable-nested --boundary-loss-type soft_dice --multi-scale-heads --multi-scale-head-mode separate --multi-scale-fusion weighted_sum --image-size 256 256 --patience 15 --small-polyp-sampling-power 0.5
+
+Early stopping at epoch 31 (patience=15).
+[Eval][Epoch 0] Step 5/5 | loss=0.1939 | dice=0.9418 | iou=0.8925
+[test] IoU: 0.8925 | Dice: 0.9418
+
+Best validation IoU: 0.8915
+Best validation Dice: 0.9414
+Best threshold: 0.60
+Best nested active: False
+Final test nested active: False
+```

@@ -32,15 +32,6 @@ This patch gives you a **simple but stronger baseline** than the current plain U
  CUDA_VISIBLE_DEVICES=6 python train_baseline_clean.py     --file-path datasets/Adenocarcinoma     --save-root outputs/Adenocarcinoma/swin_v3     --encoder-name swinv2_base     --use-pretrained     --image-size 256 256     --batch-size 32     --epochs 80     --warmup-epochs 8     --patience 15     --enable-nested     --nested-start-epoch 12     --nested-dim 128     --nested-prototypes 8     --nested-residual-scale 0.08     --nested-memory-mode fast_slow     --nested-memory-hidden 128     --nested-slow-momentum-scale 0.35     --use-ema --ema-decay 0.9995     --use-tta --tta-scales 1.0      --dropout 0.1     --small-polyp-sampling-power 0.35     --thresholds 0.40 0.45 0.50 0.55 
 ```
 
-```
- CUDA_VISIBLE_DEVICES=7 python train.py \
-  --dataset kvasir \
-  --file-path datasets/Adenocarcinoma     
-  --save-root outputs/Adenocarcinoma_nested/
-  --encoder-name swinv2_base --use-pretrained \
-  --image-size 384 384 --batch-size 8 --epochs 60 --warmup-epochs 5 \
-  --nl-apply-stages 0 1 2 3 --nl-inner-steps 1 2 3 4 --nl-inner-lr 0.01 \
-  epochs 200 --enable-nested --nested-start-epoch 20 
 
 
 ## Why this baseline is safer
