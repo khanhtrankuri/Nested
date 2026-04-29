@@ -418,15 +418,10 @@ class NLLossWrapper(nn.Module):
             return torch.zeros((), device=outputs["logits"].device,
                                dtype=outputs["logits"].dtype)
 
-        proto_cache = decoder_info.get("proto_cache")
-        if proto_cache is None:
-            return torch.zeros((), device=outputs["logits"].device,
-                               dtype=outputs["logits"].dtype)
-
-        # Compute on fast prototypes similarity matrix
-        sim_fast = proto_cache.get("attn_fast")
-        sim_slow = proto_cache.get("attn_slow")
-        if sim_fast is None or sim_slow is None:
+        # Get attention weights directly from decoder_info (not from proto_cache)
+        attn_fast = decoder_info.get("prototype_sim_fast")
+        attn_slow = decoder_info.get("prototype_sim_slow")
+        if attn_fast is None or attn_slow is None:
             return torch.zeros((), device=outputs["logits"].device,
                                dtype=outputs["logits"].dtype)
 
@@ -439,7 +434,7 @@ class NLLossWrapper(nn.Module):
             # Negate: higher entropy = lower loss
             return -ent
 
-        loss = 0.5 * (_neg_entropy(sim_fast) + _neg_entropy(sim_slow))
+        loss = 0.5 * (_neg_entropy(attn_fast) + _neg_entropy(attn_slow))
         return loss
 
     def forward(self, outputs, targets: torch.Tensor, return_components: bool = False):

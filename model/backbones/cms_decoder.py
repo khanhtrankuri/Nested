@@ -350,8 +350,8 @@ class PrototypeMemoryBank(nn.Module):
             "context_spatial": context_spatial,
             "context_global": context,
             "token": token.detach(),
-            "attn_fast": attn_fast.detach(),
-            "attn_slow": attn_slow.detach(),
+            "attn_fast": attn_fast,  # Keep gradient for diversity loss
+            "attn_slow": attn_slow,  # Keep gradient for diversity loss
             "mix": mix.detach(),
         }
 
