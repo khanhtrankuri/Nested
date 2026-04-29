@@ -4,7 +4,13 @@
       "Bash(python train.py --help)",
       "Bash(python *)",
       "Bash(pip list *)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "Bash(docker exec *)",
+      "WebSearch",
+      "mcp__browserdocs__docs_add_source",
+      "mcp__browserdocs__docs_search",
+      "mcp__browserdocs__docs_lookup_page",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

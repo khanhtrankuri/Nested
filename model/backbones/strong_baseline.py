@@ -170,6 +170,7 @@ class TimmPyramidEncoder(nn.Module):
         strict_pretrained: bool = False,
         pretrained_cache_dir: Optional[str] = None,
         img_size: Optional[int] = None,
+        strict_img_size: bool = True,
     ):
         super().__init__()
         try:
@@ -182,6 +183,7 @@ class TimmPyramidEncoder(nn.Module):
             "features_only": True,
             "out_indices": (0, 1, 2, 3),
             "in_chans": int(in_channels),
+            "strict_img_size": strict_img_size,
         }
         if img_size is not None:
             create_kwargs["img_size"] = img_size
@@ -409,6 +411,7 @@ def build_encoder(
             strict_pretrained=strict_pretrained,
             pretrained_cache_dir=pretrained_cache_dir,
             img_size=img_size,
+            strict_img_size=False,  # Enable dynamic mask for flexible input sizes
         )
     raise ValueError(f"Unsupported encoder_name: {encoder_name}")
 
