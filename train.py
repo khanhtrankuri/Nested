@@ -38,6 +38,7 @@ from engine.train_eval_clean import (
     train_one_epoch_clean,
 )
 from loss.strong_baseline_loss import StrongBaselineLoss
+from loss.boundary_losses import SoftDiceBoundaryLoss, FocalBoundaryLoss, CombinedBoundaryLoss
 from model.backbones.self_modifying_encoder_cms import (
     CMSSelfModifyingEncoder,
     DEFAULT_STAGE_CONFIG,
@@ -229,6 +230,15 @@ class NestedPolypModel(nn.Module):
         else:
             avg_gate = zero
 
+        # Boundary refinement metrics
+        boundary_info = decoder_info.get("boundary", {})
+        boundary_gate = boundary_info.get("gate_mean", zero)
+        edge_ratio = zero
+        if "edge_map" in boundary_info:
+            edge_map = boundary_info["edge_map"]
+            # Ratio of pixels considered as edges (thresholded)
+            edge_ratio = (edge_map > 0.1).float().mean()
+
         # Prototype norm from banks (if available)
         proto_norm = zero
         proto_ready = zero
@@ -269,6 +279,8 @@ class NestedPolypModel(nn.Module):
             "memory_quality": torch.ones((), device=device, dtype=dtype),
             "memory_ready_ratio": proto_ready,
             "residual_gate": avg_gate,
+            "boundary_gate": boundary_gate,
+            "edge_ratio": edge_ratio,
         }
 
     def forward(self, x: torch.Tensor, use_nested: bool = False) -> Dict[str, torch.Tensor]:
@@ -359,10 +371,11 @@ class NestedPolypModel(nn.Module):
 
 class NLLossWrapper(nn.Module):
     """StrongBaselineLoss + auxiliary surprise loss (Level 2a) +
-    prototype diversity loss (Level 2c).
+    prototype diversity loss (Level 2c) + boundary loss.
 
     Surprise drives the encoder's inner-loop reconstructor.
     Prototype diversity prevents K prototypes from collapsing.
+    Boundary loss improves edge accuracy (critical for small polyps).
     """
 
     def __init__(
@@ -370,13 +383,33 @@ class NLLossWrapper(nn.Module):
         base_loss: nn.Module,
         surprise_weight: float = 0.05,
         diversity_weight: float = 0.01,
+        boundary_weight: float = 0.1,
+        boundary_loss_type: str = "soft_dice",
         multi_scale_weights: Optional[List[float]] = None,
     ):
         super().__init__()
         self.base = base_loss
         self.surprise_weight = float(surprise_weight)
         self.diversity_weight = float(diversity_weight)
+        self.boundary_weight = float(boundary_weight)
         self.multi_scale_weights = list(multi_scale_weights) if multi_scale_weights is not None else [0.1, 0.2, 0.3, 0.4]
+
+        # Boundary loss module
+        if boundary_weight > 0:
+            if boundary_loss_type == "soft_dice":
+                self.boundary_loss = SoftDiceBoundaryLoss(boundary_weight=2.0)
+            elif boundary_loss_type == "focal":
+                self.boundary_loss = FocalBoundaryLoss(boundary_weight=3.0)
+            elif boundary_loss_type == "combined":
+                self.boundary_loss = CombinedBoundaryLoss(
+                    dice_weight=1.0,
+                    focal_weight=0.5,
+                    hausdorff_weight=0.1,
+                )
+            else:
+                raise ValueError(f"Unknown boundary_loss_type: {boundary_loss_type}")
+        else:
+            self.boundary_loss = None
 
     def _prototype_diversity_loss(self, outputs: Dict) -> torch.Tensor:
         """Penalize prototype collapse: encourage pairwise dissimilarity."""
@@ -439,6 +472,19 @@ class NLLossWrapper(nn.Module):
         else:
             div_loss = torch.zeros((), device=total.device, dtype=total.dtype)
 
+        # --- Boundary loss ---
+        if isinstance(outputs, dict) and self.boundary_loss is not None:
+            logits = outputs.get("logits")
+            if logits is not None:
+                # Use targets from function argument
+                # Note: targets shape (B, 1, H, W) should match logits
+                b_loss = self.boundary_loss(logits, targets)
+                total = total + self.boundary_weight * b_loss
+            else:
+                b_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+        else:
+            b_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+
         # --- Multi-Scale auxiliary losses ---
         if isinstance(outputs, dict) and "multi_scale_logits" in outputs:
             scale_logits = outputs["multi_scale_logits"]
@@ -465,6 +511,7 @@ class NLLossWrapper(nn.Module):
         if return_components:
             components["loss_surprise"] = float(surprise_total.detach().item())
             components["loss_diversity"] = float(div_loss.detach().item())
+            components["loss_boundary"] = float(b_loss.detach().item())
             components["loss_total"] = float(total.detach().item())
             return total, components
         return total
@@ -559,6 +606,12 @@ def build_parser():
     parser.add_argument("--fast-momentum", type=float, default=0.05)
     parser.add_argument("--slow-momentum", type=float, default=0.003)
     parser.add_argument("--diversity-weight", type=float, default=0.01)
+
+    # --- Boundary Loss ---
+    parser.add_argument("--boundary-weight", type=float, default=0.1,
+                        help="Weight for boundary-aware loss (0 to disable)")
+    parser.add_argument("--boundary-loss-type", choices=["soft_dice", "focal", "combined"],
+                        default="soft_dice", help="Type of boundary loss")
 
     # --- Multi-Scale Segmentation Heads ---
     parser.add_argument("--multi-scale-heads", action="store_true",
@@ -813,29 +866,29 @@ def main():
         test_loaders["testA"] = testA_loader
         test_loaders["testB"] = testB_loader
     else:
-        train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
-            file_path=args.file_path,
-            image_size=tuple(args.image_size),
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            seed=args.seed,
-            protocol=args.protocol,
-            fold_index=args.fold_index,
-            num_folds=args.num_folds,
-            train_augmentation=True,
-            stratified_split=args.stratified_split,
-            small_polyp_sampling_power=args.small_polyp_sampling_power,
-        )
-        test_loaders["test"] = test_loader
-        # train_loader, val_loader, test_loader, meta_info = build_presplit_dataloaders(
-        #     root=args.file_path,
+        # train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
+        #     file_path=args.file_path,
         #     image_size=tuple(args.image_size),
         #     batch_size=args.batch_size,
         #     num_workers=args.num_workers,
+        #     seed=args.seed,
+        #     protocol=args.protocol,
+        #     fold_index=args.fold_index,
+        #     num_folds=args.num_folds,
         #     train_augmentation=True,
+        #     stratified_split=args.stratified_split,
         #     small_polyp_sampling_power=args.small_polyp_sampling_power,
         # )
         # test_loaders["test"] = test_loader
+        train_loader, val_loader, test_loader, meta_info = build_presplit_dataloaders(
+            root=args.file_path,
+            image_size=tuple(args.image_size),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            train_augmentation=True,
+            small_polyp_sampling_power=args.small_polyp_sampling_power,
+        )
+        test_loaders["test"] = test_loader
 
     if args.smoke_test:
         train_loader = _limit_loader_steps(train_loader, args.smoke_max_steps)
@@ -893,6 +946,8 @@ def main():
         StrongBaselineLoss(),
         surprise_weight=args.nl_surprise_weight,
         diversity_weight=args.diversity_weight,
+        boundary_weight=args.boundary_weight,
+        boundary_loss_type=args.boundary_loss_type,
         multi_scale_weights=args.multi_scale_weights if args.multi_scale_heads else None,
     )
 

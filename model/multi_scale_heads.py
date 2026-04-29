@@ -58,13 +58,15 @@ class MultiScaleSegHeads(nn.Module):
             self.logits_weights = nn.Parameter(torch.ones(num_scales))
             self.eps = 1e-4
         elif fusion_type == 'attention':
-            # Attention mechanism to combine logits based on feature context
-            # Use the highest resolution features (s2) to generate attention map
+            # Attention mechanism to combine logits based on multi-scale context
+            # Input: concatenated features from all scales (upsampled to s2 resolution)
+            # Channels = num_scales * in_channels
+            combined_channels = num_scales * in_channels
             self.attention = nn.Sequential(
-                nn.Conv2d(in_channels, in_channels // 4, 3, padding=1, bias=False),
-                nn.BatchNorm2d(in_channels // 4),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels // 4, num_scales, 1)
+                nn.Conv2d(combined_channels, in_channels // 2, 3, padding=1, bias=False),
+                nn.GroupNorm(min(8, max(1, (in_channels // 2) // 4)), in_channels // 2),
+                nn.GELU(),
+                nn.Conv2d(in_channels // 2, num_scales, 1)
             )
         else:
             raise ValueError(f"Unknown fusion type: {fusion_type}")
@@ -129,9 +131,17 @@ class MultiScaleSegHeads(nn.Module):
             w = w / (w.sum() + self.eps)
             main_logits = sum(w[i] * logits for i, logits in enumerate(scale_logits_upsampled))
         elif self.fusion_type == 'attention':
-            # Use s2 (highest resolution) features to generate attention weights
-            attn_input = features[0]  # s2 at (B, C, H/4, W/4)
-            attn_map = self.attention(attn_input)  # (B, num_scales, H/4, W/4)
+            # Use all scales (concatenated) to generate attention weights
+            s2 = features[0]  # highest resolution: (B, C, H/4, W/4)
+            s2_size = s2.shape[-2:]
+            # Upsample all other scales to s2 resolution
+            feats_at_s2 = [s2] + [
+                F.interpolate(f, size=s2_size, mode='bilinear', align_corners=False)
+                for f in features[1:]
+            ]
+            combined = torch.cat(feats_at_s2, dim=1)  # (B, num_scales*C, H/4, W/4)
+            attn_map = self.attention(combined)  # (B, num_scales, H/4, W/4)
+            # Upsample attention to final target size to match upsampled logits
             attn_map = F.interpolate(attn_map, size=target_size, mode='bilinear', align_corners=False)
             attn_map = F.softmax(attn_map, dim=1)  # normalize across scales per pixel
 

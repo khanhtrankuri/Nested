@@ -652,6 +652,10 @@ class CMSDecoder(nn.Module):
                 proto_dim=prototype_dim,
             )
 
+        # --- Boundary Refinement Module ---
+        from model.boundary_refinement import BoundaryRefinementModule
+        self.boundary_refine = BoundaryRefinementModule(channels=fpn_channels)
+
     def forward(
         self,
         features: List[Tensor],
@@ -774,12 +778,21 @@ class CMSDecoder(nn.Module):
 
         decoder_info["proto_cache"] = proto_cache
 
+        # === Boundary Refinement (optional, applied to fused features) ===
+        boundary_out = self.boundary_refine(fused)
+        fused_refined = boundary_out['refined']
+        decoder_info['boundary'] = {
+            'edge_map': boundary_out['edge_map'].detach(),
+            'gate_mean': boundary_out['gate_mean'].detach(),
+        }
+
         # aux_feat = s5 from BiFPN (for auxiliary head)
         aux_feat = s5
 
         # Package results as dict for flexibility
         result = {
-            'fused': fused,
+            'fused': fused_refined,  # Use boundary-refined features for segmentation
+            'fused_raw': fused,  # Keep raw fused for debugging
             'aux_feat': aux_feat,
             'smoothed_features': [s2, s3, s4, s5],  # at native resolutions
             'decoder_info': decoder_info

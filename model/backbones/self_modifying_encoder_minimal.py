@@ -137,6 +137,7 @@ class SelfModifyingBlock(nn.Module):
         # ABLATION flag - mac dinh False de matching ban cu
         persist_momentum: bool = False,
         inner_momentum_beta: float = 0.9,
+        position_aware: bool = False,  # NEW
     ):
         super().__init__()
         self.channels = channels
@@ -144,15 +145,30 @@ class SelfModifyingBlock(nn.Module):
         self.inner_lr = inner_lr
         self.persist_momentum = persist_momentum
         self.inner_momentum_beta = inner_momentum_beta
+        self.position_aware = position_aware
 
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(channels, max(channels // 4, 16)),
-            nn.GELU(),
-            nn.Linear(max(channels // 4, 16), 1),
-            nn.Sigmoid(),
-        )
+        if position_aware:
+            # Spatial gate
+            self.gate = nn.Sequential(
+                nn.Conv2d(channels, channels // 4, 3, padding=1, bias=False),
+                nn.GroupNorm(min(8, max(1, (channels // 4) // 4)), channels // 4),
+                nn.GELU(),
+                nn.Conv2d(channels // 4, 1, 1),  # bias=True by default
+                nn.Sigmoid()
+            )
+            self.gate[-2].bias.data.fill_(-2.0)  # last conv before sigmoid
+        else:
+            # Global gate
+            self.gate = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(channels, max(channels // 4, 16)),
+                nn.GELU(),
+                nn.Linear(max(channels // 4, 16), 1),
+                nn.Sigmoid(),
+            )
+            self.gate[-2].bias.data.fill_(-2.0)  # last linear before sigmoid
+            # (self.gate[-1] is Sigmoid, no bias)
         hidden = channels * modifier_expansion
         self.modifier = nn.Sequential(
             nn.Conv2d(channels, hidden, 1, bias=False),
@@ -217,10 +233,16 @@ class SelfModifyingBlock(nn.Module):
     def forward(self, x: Tensor, return_info: bool = False):
         saved_state = {n: p.data.clone() for n, p in self.modifier.named_parameters()}
         modification, aux_surprise, steps_info = self._inner_loop(x)
-        gate = self.gate(x).unsqueeze(-1).unsqueeze(-1)
+
+        gate = self.gate(x)
+        if not self.position_aware:
+            gate = gate.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1, 1)
+        # else: gate shape (B, 1, H, W)
+
         output = x + self.residual_scale * gate * modification
         for n, p in self.modifier.named_parameters():
             p.data.copy_(saved_state[n])
+
         info = None
         if return_info:
             info = {
@@ -229,6 +251,7 @@ class SelfModifyingBlock(nn.Module):
                 "inner_lr": self._get_inner_lr(),
                 "inner_steps": steps_info,
                 "aux_surprise": aux_surprise,
+                "position_aware": self.position_aware,
             }
         return output, info
 

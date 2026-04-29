@@ -205,6 +205,7 @@ class CMSSelfModifyingBlock(nn.Module):
       (dùng cho stage sâu = "slow-fast memory" của CMS)
     - `persist_momentum=False` → reset mỗi sample (stage nông)
     - Surprise objective có thể là 'consistency' (rẻ) hoặc 'full' (đắt)
+    - Position-aware gating (NEW): gate có thể spatial để nhấn mạnh boundary pixels
     """
 
     def __init__(
@@ -218,6 +219,7 @@ class CMSSelfModifyingBlock(nn.Module):
         surprise_type: str = "full",
         persist_momentum: bool = True,
         residual_init: float = 0.05,
+        position_aware: bool = False,  # NEW
     ):
         super().__init__()
         assert inner_steps >= 1, "inner_steps phải ≥ 1. Dùng identity block nếu =0."
@@ -229,16 +231,32 @@ class CMSSelfModifyingBlock(nn.Module):
         self.inner_momentum = inner_momentum
         self.persist_momentum = persist_momentum
         self.surprise_type = surprise_type
+        self.position_aware = position_aware
 
         # Level 1 — outer-trained gate
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(channels, max(channels // 4, 16)),
-            nn.GELU(),
-            nn.Linear(max(channels // 4, 16), 1),
-            nn.Sigmoid(),
-        )
+        if position_aware:
+            # Spatial gate: produces (B, 1, H, W)
+            self.gate = nn.Sequential(
+                nn.Conv2d(channels, channels // 4, 3, padding=1, bias=False),
+                nn.GroupNorm(min(8, max(1, (channels // 4) // 4)), channels // 4),
+                nn.GELU(),
+                nn.Conv2d(channels // 4, 1, 1),  # bias=True by default
+                nn.Sigmoid()
+            )
+            # Init bias to be conservative
+            self.gate[-2].bias.data.fill_(-2.0)
+        else:
+            # Global gate: produces (B, 1, 1, 1)
+            self.gate = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(channels, max(channels // 4, 16)),
+                nn.GELU(),
+                nn.Linear(max(channels // 4, 16), 1),
+                nn.Sigmoid(),
+            )
+            # Init bias of the last Linear (before Sigmoid)
+            self.gate[-2].bias.data.fill_(-2.0)
 
         # Level 2 — self-modifying weights (inner loop target)
         hidden = channels * modifier_expansion
@@ -341,7 +359,12 @@ class CMSSelfModifyingBlock(nn.Module):
 
         modification, aux_surprise, steps_info = self._inner_loop(x)
 
-        gate = self.gate(x).unsqueeze(-1).unsqueeze(-1)
+        # Compute gate (spatial or global)
+        gate = self.gate(x)
+        if not self.position_aware:
+            gate = gate.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1, 1) → broadcast
+        # else: gate shape (B, 1, H, W) — already spatial
+
         output = x + self.residual_scale * gate * modification
 
         # Restore để sample tiếp theo có cùng meta-learned init
@@ -359,6 +382,7 @@ class CMSSelfModifyingBlock(nn.Module):
                 "aux_surprise": aux_surprise,
                 "surprise_type": self.surprise_type,
                 "persist_momentum": self.persist_momentum,
+                "position_aware": self.position_aware,
             }
         return output, info
 
@@ -421,7 +445,7 @@ DEFAULT_STAGE_CONFIG: List[Dict[str, Any]] = [
         "lora_rank": 4,
         "residual_init": 0.05,
     },
-    # c4 — mid-deep, moderate inner loop
+    # c4 — mid-deep, moderate inner loop, position-aware (NEW)
     {
         "mode": "full",
         "inner_steps": 3,
@@ -431,17 +455,19 @@ DEFAULT_STAGE_CONFIG: List[Dict[str, Any]] = [
         "surprise_type": "full",
         "persist_momentum": True,
         "residual_init": 0.05,
+        "position_aware": True,  # NEW: spatial gating focuses on boundaries
     },
-    # c5 — deepest, strongest inner loop
+    # c5 — deepest, strongest inner loop, position-aware (NEW)
     {
         "mode": "full",
         "inner_steps": 6,
-        "inner_lr": 2e-5,
+        "inner_lr": 2e-2,
         "inner_momentum": 0.95,
         "modifier_expansion": 4,
         "surprise_type": "full",
         "persist_momentum": True,
         "residual_init": 0.08,
+        "position_aware": True,  # NEW: spatial gating focuses on boundaries
     },
 ]
 
@@ -537,6 +563,7 @@ class CMSSelfModifyingEncoder(nn.Module):
                     surprise_type=str(cfg.get("surprise_type", "full")),
                     persist_momentum=bool(cfg.get("persist_momentum", True)),
                     residual_init=float(cfg.get("residual_init", 0.05)),
+                    position_aware=bool(cfg.get("position_aware", False)),  # NEW
                 )
             else:
                 raise ValueError(f"Unknown stage mode: {mode}")
