@@ -183,10 +183,8 @@ class TimmPyramidEncoder(nn.Module):
             "features_only": True,
             "out_indices": (0, 1, 2, 3),
             "in_chans": int(in_channels),
+            "strict_img_size": strict_img_size,
         }
-        # Only add strict_img_size for Swin transformers (they support it)
-        if variant.startswith("swin") or variant.startswith("swinv2"):
-            create_kwargs["strict_img_size"] = strict_img_size
         if img_size is not None:
             create_kwargs["img_size"] = img_size
         loaded_pretrained = False
