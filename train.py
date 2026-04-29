@@ -509,6 +509,7 @@ def build_parser():
             "swinv2_tiny",
             "swinv2_small",
             "swinv2_base",
+            "swinv2_large",
         ],
         default="pvtv2_b2",
     )
@@ -812,29 +813,29 @@ def main():
         test_loaders["testA"] = testA_loader
         test_loaders["testB"] = testB_loader
     else:
-        # train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
-        #     file_path=args.file_path,
-        #     image_size=tuple(args.image_size),
-        #     batch_size=args.batch_size,
-        #     num_workers=args.num_workers,
-        #     seed=args.seed,
-        #     protocol=args.protocol,
-        #     fold_index=args.fold_index,
-        #     num_folds=args.num_folds,
-        #     train_augmentation=True,
-        #     stratified_split=args.stratified_split,
-        #     small_polyp_sampling_power=args.small_polyp_sampling_power,
-        # )
-        # test_loaders["test"] = test_loader
-        train_loader, val_loader, test_loader, meta_info = build_presplit_dataloaders(
-            root=args.file_path,
+        train_loader, val_loader, test_loader, meta_info = build_clean_dataloaders(
+            file_path=args.file_path,
             image_size=tuple(args.image_size),
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            seed=args.seed,
+            protocol=args.protocol,
+            fold_index=args.fold_index,
+            num_folds=args.num_folds,
             train_augmentation=True,
+            stratified_split=args.stratified_split,
             small_polyp_sampling_power=args.small_polyp_sampling_power,
         )
         test_loaders["test"] = test_loader
+        # train_loader, val_loader, test_loader, meta_info = build_presplit_dataloaders(
+        #     root=args.file_path,
+        #     image_size=tuple(args.image_size),
+        #     batch_size=args.batch_size,
+        #     num_workers=args.num_workers,
+        #     train_augmentation=True,
+        #     small_polyp_sampling_power=args.small_polyp_sampling_power,
+        # )
+        # test_loaders["test"] = test_loader
 
     if args.smoke_test:
         train_loader = _limit_loader_steps(train_loader, args.smoke_max_steps)
