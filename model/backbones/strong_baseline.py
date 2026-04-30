@@ -422,7 +422,8 @@ class ConvBNAct(nn.Module):
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            # nn.ReLU(inplace=True),
+            nn.GELU()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -439,7 +440,8 @@ class SEBlock(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
+            # nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(mid, channels, bias=False),
             nn.Sigmoid(),
         )
@@ -561,7 +563,8 @@ class SafeNestedResidualRefiner(nn.Module):
         self.uncertainty_gate_net = nn.Sequential(
             nn.Conv2d(feat_channels + 1, feat_channels // 2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(feat_channels // 2),
-            nn.ReLU(inplace=True),
+            # nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(feat_channels // 2, 1, kernel_size=1),
             nn.Sigmoid(),
         )
