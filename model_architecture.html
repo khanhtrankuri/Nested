@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiến trúc Model - PolyMemnet</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            padding: 30px;
+        }
+
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+            margin-bottom: 30px;
+        }
+
+        h2 {
+            color: #34495e;
+            margin-top: 40px;
+            margin-bottom: 20px;
+            font-size: 1.4em;
+        }
+
+        .mermaid {
+            margin: 30px 0;
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .section {
+            margin-bottom: 50px;
+        }
+
+        .legend {
+            background: #e8f4f8;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            font-size: 0.9em;
+        }
+
+        .legend-item {
+            display: inline-block;
+            margin-right: 20px;
+            margin-bottom: 10px;
+        }
+
+        .color-box {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            margin-right: 5px;
+            vertical-align: middle;
+            border-radius: 3px;
+        }
+
+        .code-block {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Consolas', monospace;
+            font-size: 0.9em;
+            overflow-x: auto;
+            margin: 15px 0;
+            white-space: pre;
+        }
+
+        .important {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 0 8px 8px 0;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🎯 Kiến trúc Model - PolyMemnet Project</h1>
+
+        <div class="legend">
+            <strong>Chú giải:</strong><br>
+            <div class="legend-item"><span class="color-box" style="background:#3498db;"></span>Encoder</div>
+            <div class="legend-item"><span class="color-box" style="background:#e74c3c;"></span>Decoder</div>
+            <div class="legend-item"><span class="color-box" style="background:#2ecc71;"></span>Prototype Memory</div>
+            <div class="legend-item"><span class="color-box" style="background:#f39c12;"></span>Loss</div>
+            <div class="legend-item"><span class="color-box" style="background:#9b59b6;"></span>Self-Modifying</div>
+        </div>
+
+        <div class="section">
+            <h2>📁 File Structure (Real)</h2>
+            <div class="code-block">
+                model/
+                ├── backbones/
+                │ ├── strong_baseline.py # ✅ TinyConvNeXtEncoder, TorchvisionConvNeXtEncoder,
+                │ │ # TimmPyramidEncoder, OfflinePyramidEncoderB2,
+                │ │ # FPNDecoder, SafeNestedResidualRefiner,
+                │ │ # StrongBaselinePolypModel
+                │ ├── self_modifying_encoder_cms.py # ✅ CMSSelfModifyingEncoder, CMSSelfModifyingBlock,
+                │ │ # LightAdaptor, ConsistencySurprise, FullSurprise
+                │ └── cms_decoder.py # ✅ CMSDecoder, CMSMemoryModule, PrototypeMemoryBank,
+                │ # UncertaintyAwareFusion
+                ├── advanced_polymemnet.py # ✅ AdvancedPolyMemnet (tích hợp tất cả enhancements)
+                ├── advanced_modules.py # ✅ CrossStageModulator, AdaptiveInnerLoopController,
+                │ # AdaptiveCMSSelfModifyingBlock, MetaInnerOptimizer,
+                │ # MetaOptimizedSelfModifyingBlock, HierarchicalPrototypeBank
+                ├── multi_scale_heads.py # ✅ (chưa dùng)
+                └── boundary_refinement.py # ✅ BoundaryRefinementModule (dùng trong CMSDecoder)
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🎯 Hai Architecture Chính</h2>
+
+            <h3>1. StrongBaselinePolypModel (Baseline)</h3>
+            <div class="mermaid">
+                graph TD
+                INPUT["Input Image<br>3xHxW"]
+                ENC["Encoder<br>Backbone"]
+                DEC["FPNDecoder<br>BiFPN + SE"]
+                REF["SafeNestedResidualRefiner<br>Dual Memory Banks"]
+                HEAD["Segmentation Heads<br>coarse + aux"]
+
+                INPUT --> ENC
+                ENC --> |c2-c5| DEC
+                DEC --> |fused + aux| HEAD
+                DEC --> |coarse_logits| REF
+                REF --> |refined| HEAD
+
+                style ENC fill:#3498db
+                style DEC fill:#e74c3c
+                style REF fill:#2ecc71
+                style HEAD fill:#f39c12
+            </div>
+
+            <div class="important">
+                <strong>Components:</strong><br>
+                • <strong>Encoder:</strong> 4 backbone options (TinyConvNeXt, ConvNeXt from torchvision, PVTv2,
+                SwinV2)<br>
+                • <strong>Decoder:</strong> FPNDecoder với BiFPN weighted fusion + SE channel attention<br>
+                • <strong>Refiner:</strong> SafeNestedResidualRefiner (dual memory: fast + slow, uncertainty-gated)<br>
+                • <strong>Loss:</strong> StrongBaselineLoss (7 components: BCE, Dice, Lovász, Aux, Boundary,
+                Consistency, Sparsity)
+            </div>
+
+            <h3>2. AdvancedPolyMemnet (Full Featured)</h3>
+            <div class="mermaid">
+                graph TD
+                INPUT2["Input Image<br>3xHxW"]
+                ENC2["CMSSelfModifyingEncoder<br>Cross-Stage + Adaptive"]
+                DEC2["CMSDecoder<br>Hierarchical Prototypes"]
+                HEAD2["Segmentation Heads<br>coarse + aux"]
+
+                INPUT2 --> ENC2
+                ENC2 --> |c2-c5 adapted| DEC2
+                DEC2 --> |fused + decoder_info| HEAD2
+
+                style ENC2 fill:#9b59b6
+                style DEC2 fill:#e74c3c
+                style HEAD2 fill:#f39c12
+            </div>
+
+            <div class="important">
+                <strong>6 Enhancements:</strong><br>
+                1. <strong>Cross-Stage Modulation:</strong> Attention between encoder stages<br>
+                2. <strong>Adaptive CMS:</strong> Dynamic inner loop steps/lr based on surprise<br>
+                3. <strong>Meta Inner Optimizer:</strong> LSTM-based learned optimizer (thay SGD)<br>
+                4. <strong>Hierarchical Prototypes:</strong> Tree-structured memory bank (3 levels)<br>
+                5. <strong>MC Dropout:</strong> Uncertainty estimation at inference<br>
+                6. <strong>Enhanced Loss:</strong> +6 components (contrastive, consistency, sparsity, quality)
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🔧 Encoder Deep Dive</h2>
+
+            <h3>1. Backbone Options</h3>
+            <div class="code-block">
+                # From strong_baseline.py
+
+                def build_encoder(encoder_name: str, ...):
+                - "tiny_convnext": TinyConvNeXtEncoder (custom, lightweight, random init)
+                - "convnext_tiny/small/base/large": TorchvisionConvNeXtEncoder (pretrained available)
+                - "pvtv2_b2": TimmPyramidEncoder with pvt_v2_b2 (fallback to OfflinePyramidEncoderB2 if timm
+                unavailable)
+                - "pvtv2_b5": TimmPyramidEncoder with pvt_v2_b5
+                - "convnextv2_tiny/base/large": TimmPyramidEncoder with convnextv2 variants
+                - "swinv2_tiny/small/base/large": TimmPyramidEncoder with swinv2 variants (requires img_size)
+            </div>
+
+            <p><strong>All return 4 stages:</strong> c2 (1/4), c3 (1/8), c4 (1/16), c5 (1/32)</p>
+
+            <h3>2. CMSSelfModifyingEncoder (CMS-aware)</h3>
+            <div class="mermaid">
+                graph TB
+                BB["Backbone<br>e.g., ConvNeXt"]
+                subgraph "Per-Stage Modules"
+                direction LR
+                C2["c2<br>mode: none<br>(frozen)"]
+                C3["c3<br>mode: light<br>LightAdaptor<br>LoRA rank=4"]
+                C4["c4<br>mode: full<br>CMSSelfModifyingBlock<br>inner_steps=3<br>position-aware<br>momentum=0.9"]
+                C5["c5<br>mode: full<br>CMSSelfModifyingBlock<br>inner_steps=6<br>position-aware<br>momentum=0.95"]
+                end
+                CROSS["Cross-Stage Modulator<br>optional"]
+                OUT["c2', c3', c4', c5'"]
+
+                BB --> CROSS
+                CROSS --> C2 & C3 & C4 & C5
+                C2 --> OUT
+                C3 --> OUT
+                C4 --> OUT
+                C5 --> OUT
+
+                style C4 fill:#9b59b6
+                style C5 fill:#9b59b6
+            </div>
+
+            <div class="code-block">
+                # DEFAULT_STAGE_CONFIG from self_modifying_encoder_cms.py
+
+                DEFAULT_STAGE_CONFIG: List[Dict[str, Any]] = [
+                # c2 — shallow, stable
+                {
+                "mode": "none",
+                },
+                # c3 — mid-low, light adaptor
+                {
+                "mode": "light",
+                "lora_rank": 4,
+                "residual_init": 0.05,
+                },
+                # c4 — mid-deep, moderate inner loop, position-aware (NEW)
+                {
+                "mode": "full",
+                "inner_steps": 3,
+                "inner_lr": 5e-3,
+                "inner_momentum": 0.9,
+                "modifier_expansion": 2,
+                "surprise_type": "full",
+                "persist_momentum": True,
+                "residual_init": 0.05,
+                "position_aware": True, # NEW: spatial gating focuses on boundaries
+                },
+                # c5 — deepest, strongest inner loop, position-aware (NEW)
+                {
+                "mode": "full",
+                "inner_steps": 6,
+                "inner_lr": 2e-2,
+                "inner_momentum": 0.95,
+                "modifier_expansion": 4,
+                "surprise_type": "full",
+                "persist_momentum": True,
+                "residual_init": 0.08,
+                "position_aware": True, # NEW: spatial gating focuses on boundaries
+                },
+                ]
+
+                # Progressive Unfreeze Schedule:
+                # epoch >= 0: unfreeze c4, c5 (deep)
+                # epoch >= 8: unfreeze c3 (mid)
+                # epoch >= 16: unfreeze c2 + stem (shallow)
+
+                # LLRD (Layer-wise LR Decay): backbone_lr_decay=0.5
+                # stem: lr * 0.5^4 ≈ lr * 0.0625
+                # c2: lr * 0.5^3 ≈ lr * 0.125
+                # c3: lr * 0.5^2 ≈ lr * 0.25
+                # c4: lr * 0.5^1 ≈ lr * 0.5
+                # c5: lr * 0.5^0 = lr
+            </div>
+
+            <h3>3. CMSSelfModifyingBlock (Full Mode)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "Inner Loop (Per-Sample Adaptation)"
+                direction LR
+                X[x]
+                MOD["Modifier Network<br>1x1 down → GN → GELU → Dropout → 1x1 up"]
+                SURP["Surprise Objective<br>Reconstruction + Consistency"]
+                GATE["Gate Network<br>Global or Spatial"]
+                SCALE["residual_scale<br>learnable"]
+
+                X --> MOD
+                MOD --> SURP
+                SURP -.-> |η, steps| MOD
+
+                GATE --> GAMMA
+                SCALE --> RES
+                MOD --> RES
+                X --> RES
+                GAMMA["γ = gate(x)"]
+                RES["x + scale × γ × modifier(x)"]
+                end
+
+                subgraph "Persistent Momentum Buffer"
+                MOM["SGD momentum<br>kept across batches"]
+                end
+
+                MOD -.-> MOM
+            </div>
+
+            <h3>4. LightAdaptor (Light Mode)</h3>
+            <div class="mermaid">
+                graph LR
+                subgraph "LightAdaptor - LoRA-like"
+                X[x]
+                DOWN["1x1 conv<br>rank=4"]
+                ACT[GELU]
+                UP["1x1 conv<br>init zeros"]
+                SCALE["residual_scale"]
+
+                X --> DOWN --> ACT --> UP --> DELTA["Δ delta"]
+                SCALE --> OUT
+                X --> OUT
+                DELTA --> OUT
+                OUT["x + scale × delta"]
+                end
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🎨 Decoder Deep Dive</h2>
+
+            <h3>1. FPNDecoder (Baseline)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "BiFPN Architecture"
+                direction LR
+
+                C2["c2"] --> L2["lateral2"] --> SE2["SE"] --> P2
+                C3["c3"] --> L3["lateral3"] --> SE3["SE"] --> P3
+                C4["c4"] --> L4["lateral4"] --> SE4["SE"] --> P4
+                C5["c5"] --> L5["lateral5"] --> SE5["SE"] --> P5
+
+                P5 --> TD4["BiFPN TD4"] --> TD3["BiFPN TD3"] --> TD2["BiFPN TD2"]
+                TD2 --> BU3["BiFPN BU3"] --> BU4["BiFPN BU4"] --> BU5["BiFPN BU5"]
+
+                BU5 --> S5["smooth5"] --> FUSE
+                BU4 --> S4["smooth4"] --> FUSE
+                BU3 --> S3["smooth3"] --> FUSE
+                TD2 --> S2["smooth2"] --> FUSE
+
+                FUSE["Fusion<br>Concat + 2x ConvBNAct"]
+                end
+
+                FUSE --> |fused| OUT["Output<br>[B, C, H/4, W/4]"]
+                S5 --> |aux_feat| AUX["aux_head"]
+            </div>
+
+            <h3>2. CMSDecoder (Advanced - replaces FPNDecoder + Refiner)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "BiFPN + CMS Memory + Prototypes"
+                direction LR
+
+                C2["c2"] & C3["c3"] & C4["c4"] & C5["c5"]
+
+                subgraph "BiFPN Pipeline"
+                L2["lateral2"] & L3["lateral3"] & L4["lateral4"] & L5["lateral5"]
+                TD2["BiFPN TD2"] & TD3["BiFPN TD3"] & TD4["BiFPN TD4"]
+                BU3["BiFPN BU3"] & BU4["BiFPN BU4"] & BU5["BiFPN BU5"]
+                S2["smooth2"] & S3["smooth3"] & S4["smooth4"] & S5["smooth5"]
+                FUSE["Fusion"]
+                end
+
+                subgraph "CMS Memory Modules (per level)"
+                CMS2["CMSMemoryModule<br>Linear Attention + M₀"]
+                CMS3["CMSMemoryModule"]
+                CMS4["CMSMemoryModule"]
+                CMS5["CMSMemoryModule"]
+                end
+
+                subgraph "Prototype Bank"
+                PB["PrototypeMemoryBank<br>or HierarchicalPrototypeBank"]
+                end
+
+                subgraph "Uncertainty Fusion"
+                UF["UncertaintyAwareFusion<br>cross-level variance"]
+                end
+
+                C2 --> L2 & CMS2
+                C3 --> L3 & CMS3
+                C4 --> L4 & CMS4
+                C5 --> L5 & CMS5
+
+                CMS2 --> S2
+                CMS3 --> S3
+                CMS4 --> S4
+                CMS5 --> S5
+
+                S2 & S3 & S4 & S5 --> FUSE
+                FUSE --> PB
+                PB --> UF
+                UF --> |augmented fused| OUT
+                end
+            </div>
+
+            <div class="code-block">
+                # From cms_decoder.py
+
+                class CMSDecoder(nn.Module):
+                - BiFPN với SE attention (giữ nguyên)
+                - CMSMemoryModule trên các level được chọn (default: tất cả p2,p3,p4,p5)
+                * Mỗi level có linear attention memory với meta-learned M₀
+                * Gate output để kiểm soát ảnh hưởng
+                * Update frequency: p2 (nhanh) > p3 > p4 > p5 (chậm)
+                - PrototypeMemoryBank (dual-speed EMA) hoặc HierarchicalPrototypeBank
+                - UncertaintyAwareFusion: ước lượng uncertainty từ cross-level variance
+                - BoundaryRefinementModule (optional)
+
+                # Mỗi level FPN có resolution khác nhau:
+                # p2: 1/4 → ~9216 tokens (HxW) → memory nhanh, chi tiết spatial
+                # p3: 1/8 → ~2304 tokens → memory trung bình
+                # p4: 1/16 → ~576 tokens → memory chậm, ngữ nghĩa
+                # p5: 1/32 → ~144 tokens → memory chậm nhất, toàn cục
+            </div>
+
+            <h3>3. SafeNestedResidualRefiner (Baseline Refiner)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "SafeNestedResidualRefiner"
+                direction LR
+
+                FEAT["fused features"]
+                COARSE["coarse_logits"]
+
+                subgraph "Token Computation"
+                QP["query_proj"]
+                TOK["Token<br>weighted avg by probs + uncertainty"]
+                end
+
+                subgraph "Dual Memory Banks"
+                FAST["Fast Bank<br>momentum=0.03"]
+                SLOW["Slow Bank<br>momentum=0.0075"]
+                end
+
+                subgraph "Spatial Attention"
+                ATT_F["spatial attention<br>fast"]
+                ATT_S["spatial attention<br>slow"]
+                end
+
+                CTX_F["context_fast"]
+                CTX_S["context_slow"]
+
+                subgraph "Context Mixing"
+                MIX["mix gate<br>learned"]
+                BLEND["blend = mix×fast + (1-mix)×slow"]
+                end
+
+                subgraph "Uncertainty Gate"
+                UG["uncertainty_gate_net"]
+                GATE["gate = sigmoid(MLP([feat, unc]))"]
+                end
+
+                subgraph "Residual Head"
+                CONCAT["concat(feat, context, unc)"]
+                HEAD["2x ConvBNAct + 1x1"]
+                DELTA["delta"]
+                end
+
+                FEAT --> QP --> TOK
+                COARSE --> |uncertainty| TOK
+
+                TOK --> ATT_F
+                TOK --> ATT_S
+                FAST --> ATT_F
+                SLOW --> ATT_F
+                FAST --> ATT_S
+                SLOW --> ATT_S
+
+                ATT_F --> CTX_F
+                ATT_S --> CTX_S
+
+                CTX_F --> BLEND
+                CTX_S --> BLEND
+                MIX --> BLEND
+
+                FEAT --> RES
+                BLEND --> RES
+                COARSE --> RES
+                CONCAT --> HEAD --> DELTA --> RES
+
+                RES["refined = coarse + scale × gate × delta"]
+                end
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>⚖️ Loss Functions</h2>
+
+            <h3>1. StrongBaselineLoss (7 components)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "Loss Components"
+                BCE["BCE Loss<br>pixel-wise"]
+                DICE["Dice Loss<br>soft + hard"]
+                LOVASZ["Lovász Loss<br>mIoU surrogate"]
+                AUX["Auxiliary Loss<br>from aux head @1/8"]
+                BOUNDARY["Boundary Loss<br>focus on edges"]
+                CONSIST["Inner Consistency<br>nested stage consistency"]
+                SPARSITY["Gate Sparsity<br>regularization"]
+                end
+
+                BCE & DICE & LOVASZ & AUX & BOUNDARY & CONSIST & SPARSITY --> TOTAL["Total Loss<br>weighted sum"]
+            </div>
+
+            <h3>2. EnhancedStrongBaselineLoss (+6 components)</h3>
+            <div class="mermaid">
+                graph TB
+                subgraph "Base Loss (7 components)"
+                BASE["StrongBaselineLoss"]
+                end
+
+                subgraph "Additional Enhancements"
+                PC["Prototype Contrastive<br>diverse prototypes"]
+                IC["Inner Consistency<br>surprise decay"]
+                GS["Gate Sparsity<br>balanced activation"]
+                MQ["Memory Quality<br>usage + diversity"]
+                end
+
+                BASE --> TOTAL2["Enhanced Total Loss"]
+                PC --> TOTAL2
+                IC --> TOTAL2
+                GS --> TOTAL2
+                MQ --> TOTAL2
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📊 Data Flow Comparison</h2>
+
+            <h3>StrongBaselinePolypModel</h3>
+            <div class="mermaid">
+                graph TD
+                IMG["Input Image"] --> ENC["Encoder<br>Backbone"]
+                ENC --> |c2 H4, c3 H8, c4 H16, c5 H32| DEC["FPNDecoder"]
+                DEC --> |fused, aux_feat| HEAD1["seg_head"]
+                DEC --> |coarse_logits| REF["SafeNestedResidualRefiner"]
+                REF --> |refined_logits| HEAD2["seg_head"]
+                HEAD1 --> |coarse_logits| OUT1
+                HEAD2 --> |logits| OUT2
+                OUT1 & OUT2 --> UPS["Upsample to HxW"] --> SIG["Sigmoid"] --> MASK["Binary Mask"]
+
+                subgraph "Nested Cache"
+                NC["nested_cache<br>token, attn, update_gates"]
+                end
+                REF --> NC
+                NC -.-> |update_prototypes| REF
+            </div>
+
+            <h3>AdvancedPolyMemnet (CMSDecoder mode)</h3>
+            <div class="mermaid">
+                graph TD
+                IMG2["Input Image"] --> ENC2["CMSSelfModifyingEncoder"]
+                ENC2 --> |c2-c5 adapted| DEC2["CMSDecoder"]
+                DEC2 --> |fused, decoder_info| HEAD3["seg_head"]
+                HEAD3 --> |logits| UPS2["Upsample"] --> SIG2["Sigmoid"] --> MASK2["Mask"]
+
+                subgraph "Decoder Info & Cache"
+                DI["decoder_info:<br>- cms_gate_values<br>- uncertainty_map<br>- prototype_sim<br>- boundary"]
+                PC["proto_cache:<br>token, attn_per_level"]
+                end
+                DEC2 --> DI
+                DEC2 --> PC
+                PC -.-> |update_prototypes| DEC2
+
+                subgraph "Optional MC Dropout"
+                MC["MC Dropout<br>n samples"]
+                end
+                DEC2 --> MC --> HEAD3
+            </div>
+
+            <h3>AdvancedPolyMemnet (Standard mode - no CMSDecoder)</h3>
+            <div class="mermaid">
+                graph TD
+                IMG3["Input Image"] --> ENC3["Encoder<br>standard or CMS"]
+                ENC3 --> |c2-c5| DEC3["FPNDecoder"]
+                DEC3 --> |fused, aux_feat| REF2["SafeNestedResidualRefiner"]
+                REF2 --> |refined_logits| HEAD4["seg_head"]
+                HEAD4 --> UPS3["Upsample to HxW"] --> SIG3["Sigmoid"] --> MASK3["Binary Mask"]
+
+                subgraph "Nested Cache"
+                NC2["nested_cache"]
+                end
+                REF2 --> NC2
+                NC2 -.-> |update_prototypes| REF2
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🔍 Feature Flags Summary</h2>
+            <div class="code-block">
+                # AdvancedPolyMemnet configuration flags:
+
+                enable_nested=True # Enable nested learning system
+
+                # Enhancement 1: Cross-Stage Modulation
+                use_cross_stage_encoder=True # Add CrossStageModulator to encoder
+                cross_attn_heads=4 # Number of attention heads
+
+                # Enhancement 2: Adaptive CMS
+                use_adaptive_cms=True # Dynamic inner loop parameters
+                adaptive_max_steps=8 # Max adaptive inner steps
+
+                # Enhancement 3: Meta Optimizer
+                use_meta_optimizer=True # Replace SGD with LSTM learned optimizer
+                meta_optimizer_hidden_dim=128 # Hidden size for meta LSTM
+
+                # Enhancement 4: Hierarchical Prototypes
+                use_hierarchical_prototypes=True # Tree-structured bank (3 levels)
+                hierarchical_levels=3
+                prototypes_per_level=8 # Can be list [8, 8, 8]
+
+                # Decoder selection (mutually exclusive):
+                use_advanced_decoder=True # If True → use CMSDecoder (integrated)
+                # If False → use FPNDecoder + Refiner
+                cms_levels=[0,1,2,3] # Which FPN levels get CMS memory
+
+                # Enhancement 5: MC Dropout
+                use_mc_dropout=True # Enable MC dropout
+                mc_dropout_p=0.1
+                num_mc_samples=10 # At inference
+
+                # Enhancement 6: Enhanced Loss
+                use_enhanced_loss=True # Use EnhancedStrongBaselineLoss
+                prototype_contrastive_weight=0.05
+                inner_consistency_weight=0.02
+                gate_sparsity_weight=0.01
+                memory_quality_weight=0.02
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📈 Architecture Selection Logic</h2>
+            <div class="mermaid">
+                graph TD
+                START["Create AdvancedPolyMemnet"]
+                START --> EN_EN["enable_nested?"]
+
+                EN_EN -->|No| STD["Standard Encoder<br>no modifications"]
+                STD --> STD_DEC["Decoder?"]
+
+                EN_EN -->|Yes| CMS_ENC["CMSSelfModifyingEncoder"]
+                CMS_ENC --> USE_MOD["Use modifications?"]
+
+                USE_MOD -->|No| STD_ENC["Standard backbone<br>wrapped but unchanged"]
+                USE_MOD -->|Yes| FULL["Full CMS:<br>cross-stage + adaptive + meta"]
+
+                STD_DEC -->|use_advanced_decoder| CMS_DEC["CMSDecoder"]
+                STD_DEC -->|else| FPN_DEC["FPNDecoder + Refiner"]
+
+                CMS_DEC --> OUT["Output"]
+                FPN_DEC --> OUT
+                FULL --> CMS_DEC
+                STD_ENC --> FPN_DEC
+            </div>
+
+            <div class="important">
+                <strong>Key Points:</strong><br>
+                • <code>enable_nested=True</code> mới kích hoạt hệ thống nested learning (prototypes, uncertainty,
+                enhanced loss)<br>
+                • <code>use_advanced_decoder=True</code> → dùng CMSDecoder (thay thế cả decoder + refiner)<br>
+                • <code>use_advanced_decoder=False</code> + <code>enable_nested=True</code> → FPNDecoder +
+                SafeNestedResidualRefiner<br>
+                • Encoder modifications (cross-stage, adaptive, meta) chỉ hoạt động khi <code>enable_nested=True</code>
+                và respective flags
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🎯 Summary</h2>
+            <div class="mermaid">
+                graph LR
+                subgraph "Architecture Options"
+                A1["StrongBaselinePolypModel"]
+                A2["AdvancedPolyMemnet"]
+                end
+
+                subgraph "StrongBaseline Components"
+                SB1["Encoder<br>4 backbones"]
+                SB2["FPNDecoder<br>BiFPN + SE"]
+                SB3["SafeNestedResidualRefiner<br>dual memory"]
+                SB4["StrongBaselineLoss<br>7 components"]
+                end
+
+                subgraph "AdvancedPolyMemnet Modes"
+                ADV1["CMSDecoder mode<br>integrated CMS"]
+                ADV2["Standard mode<br>FPNDecoder + Refiner"]
+                end
+
+                subgraph "6 Enhancements"
+                E1["Cross-Stage Modulation"]
+                E2["Adaptive CMS"]
+                E3["Meta Inner Optimizer"]
+                E4["Hierarchical Prototypes"]
+                E5["MC Dropout"]
+                E6["Enhanced Loss"]
+                end
+
+                A1 --> SB1 & SB2 & SB3 & SB4
+                A2 --> ADV1 & ADV2
+                ADV1 --> E1 & E2 & E3 & E4 & E5 & E6
+                ADV2 --> E5 & E6
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'default',
+            securityLevel: 'loose',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            },
+            erDiagram: {
+                useMaxWidth: true
+            }
+        });
+    </script>
+</body>
+
+</html>
