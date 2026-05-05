@@ -43,7 +43,7 @@ from model.backbones.self_modifying_encoder_cms import (
     CMSSelfModifyingEncoder,
     DEFAULT_STAGE_CONFIG,
 )
-from model.backbones.self_modifying_encoder_minimal import MinimalCMSEncoder
+# from model.backbones.self_modifying_encoder_minimal import MinimalCMSEncoder
 from model.backbones.strong_baseline import ConvBNAct, build_encoder
 from model.backbones.cms_decoder import CMSDecoder
 
@@ -146,27 +146,25 @@ class NestedPolypModel(nn.Module):
                 num_heads=self.cross_attn_heads,
             )
 
-        if encoder_variant == "minimal":
-            self.encoder = MinimalCMSEncoder(
-                backbone=backbone,
-                feature_channels=self.backbone_channels,
-                use_llrd=False,
-                backbone_lr_decay=self.backbone_lr_decay,
-                use_progressive_unfreeze=True,
-                unfreeze_schedule=self.unfreeze_schedule,
-                c3_adaptor_mode="light",
-                use_persistent_momentum=False,
+        # Prepare cross_modulator if needed (only for CMS encoder with cross-stage enabled)
+        cross_modulator = None
+        if self.use_cross_stage:
+            from model.advanced_modules import CrossStageModulator
+            cross_modulator = CrossStageModulator(
+                channels_list=self.backbone_channels,
+                num_heads=self.cross_attn_heads,
             )
-        else:
-            self.encoder = CMSSelfModifyingEncoder(
-                backbone=backbone,
-                feature_channels=self.backbone_channels,
-                stage_configs=self.stage_configs,
-                backbone_lr_decay=self.backbone_lr_decay,
-                unfreeze_schedule=self.unfreeze_schedule,
-                use_cross_stage=self.use_cross_stage,
-                cross_modulator=cross_modulator,
-            )
+
+        # Always create encoder
+        self.encoder = CMSSelfModifyingEncoder(
+            backbone=backbone,
+            feature_channels=self.backbone_channels,
+            stage_configs=self.stage_configs,
+            backbone_lr_decay=self.backbone_lr_decay,
+            unfreeze_schedule=self.unfreeze_schedule,
+            use_cross_stage=self.use_cross_stage,
+            cross_modulator=cross_modulator,
+        )
 
         self.decoder = CMSDecoder(
             encoder_channels=self.backbone_channels,

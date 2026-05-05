@@ -15,7 +15,8 @@
       "mcp__openvision__analyze_image",
       "Bash(Get-ChildItem -Recurse -File model)",
       "Bash(Select-Object FullName)",
-      "PowerShell(Get-ChildItem -Recurse -File model | ForEach-Object { $_.FullName })"
+      "PowerShell(Get-ChildItem -Recurse -File model | ForEach-Object { $_.FullName })",
+      "Bash(tee train_output.log)"
     ]
   }
 }

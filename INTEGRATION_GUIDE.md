@@ -317,15 +317,17 @@ Với PVTv2-B2 trên Kvasir (train 900 ảnh):
 
 ```bash
 python train.py \
-    --dataset kvasir \
-    --encoder-name pvtv2_b2 --use-pretrained \
-    --image-size 384 384 --batch-size 4 --epochs 80 --warmup-epochs 5 \
+    --dataset glas \
+    --file-path
+    --encoder-name swinv2_large --use-pretrained \
+    --image-size 256 256 --batch-size 4 --epochs 80 --warmup-epochs 5 \
     --encoder-lr 1e-4 --decoder-lr 3e-4 --adaptor-lr 3e-4 \
     --backbone-lr-decay 0.5 \
     --unfreeze-deep-epoch 0 --unfreeze-mid-epoch 8 --unfreeze-shallow-epoch 20 \
     --nl-stage-config-preset default \
     --enable-nested --nested-start-epoch 20 \
-    --use-ema --patience 15
+    --use-ema --patience 15 \
+    --multi-scale-heads --use-cross-stage ----glas-val-ratio 0.15
 ```
 
 Ý tưởng:

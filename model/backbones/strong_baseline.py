@@ -401,7 +401,7 @@ def build_encoder(
         "swinv2_tiny": "swinv2_tiny_window8_256",
         "swinv2_small": "swinv2_small_window8_256",
         "swinv2_base": "swinv2_base_window8_256",
-        "swinv2_large": "swinv2_large_window12to24_192to384",  # swinv2_large_window12to24_192to384 , swinv2_large_window12to16_192to256
+        "swinv2_large": "swinv2_large_window12to16_192to256",  # swinv2_large_window12to24_192to384 , swinv2_large_window12to16_192to256
     }
     if encoder_name in swinv2_variants:
         return TimmPyramidEncoder(
